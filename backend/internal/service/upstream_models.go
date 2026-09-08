@@ -1026,6 +1026,8 @@ func buildOpenAIAPIKeyModelsRequest(ctx context.Context, account *Account, valid
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
+	// 管理面 UA（extra.upstream_user_agent），显式 header_overrides 优先
+	account.ApplyUpstreamUserAgent(req.Header)
 	// 账号级请求头覆写：模型列表探测与真实转发保持一致的最终头
 	account.ApplyHeaderOverrides(req.Header)
 	return req, nil

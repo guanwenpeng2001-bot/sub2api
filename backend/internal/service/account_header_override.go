@@ -290,3 +290,36 @@ func normalizeHeaderOverrideEntry(name, value string) (string, string, error) {
 	}
 	return lowerName, value, nil
 }
+
+// upstream_user_agent（accounts.extra）：只作用于"管理面"上游请求——模型目录同步
+// (sync-upstream) 与能力探测——不改写真实转发流量。真实流量的 UA 覆写请用
+// credentials.header_overrides。典型用途：按 User-Agent 识别客户端契约的上游
+// （如 Codex 系桥接器从 codex_cli_rs/<semver> 推导 client_version）。
+const UpstreamUserAgentExtraKey = "upstream_user_agent"
+
+const maxUpstreamUserAgentLength = 200
+
+// GetUpstreamUserAgent 返回账号级上游 User-Agent（extra.upstream_user_agent）；
+// 未配置或非法（含控制字符/超长）时为空串。
+func (a *Account) GetUpstreamUserAgent() string {
+	if a == nil {
+		return ""
+	}
+	ua := strings.TrimSpace(a.GetExtraString(UpstreamUserAgentExtraKey))
+	if ua == "" || len(ua) > maxUpstreamUserAgentLength || !httpguts.ValidHeaderFieldValue(ua) {
+		return ""
+	}
+	return ua
+}
+
+// ApplyUpstreamUserAgent 把账号的上游 User-Agent 写进请求头。调用顺序约定：
+// 先本方法、后 ApplyHeaderOverrides——credentials.header_overrides 里的显式
+// user-agent 条目优先于 extra.upstream_user_agent。
+func (a *Account) ApplyUpstreamUserAgent(h http.Header) {
+	if h == nil {
+		return
+	}
+	if ua := a.GetUpstreamUserAgent(); ua != "" {
+		h.Set("User-Agent", ua)
+	}
+}
