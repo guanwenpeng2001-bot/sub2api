@@ -12,14 +12,56 @@ import (
 
 // AdminAPIKeyHandler handles admin API key management
 type AdminAPIKeyHandler struct {
-	adminService service.AdminService
+	adminService   service.AdminService
+	apiKeyService *service.APIKeyService
 }
 
 // NewAdminAPIKeyHandler creates a new admin API key handler
-func NewAdminAPIKeyHandler(adminService service.AdminService) *AdminAPIKeyHandler {
+func NewAdminAPIKeyHandler(adminService service.AdminService, apiKeyService *service.APIKeyService) *AdminAPIKeyHandler {
 	return &AdminAPIKeyHandler{
-		adminService: adminService,
+		adminService:   adminService,
+		apiKeyService: apiKeyService,
 	}
+}
+
+// AdminCreateUserAPIKeyRequest represents the request to mint an API key
+// for a user, admin-side.
+type AdminCreateUserAPIKeyRequest struct {
+	Name    string `json:"name" binding:"required,max=100"`
+	GroupID *int64 `json:"group_id"`
+}
+
+// CreateUserAPIKey mints an API key for the given user without logging in
+// as that user — provisioning flows (e.g. cumora's per-signup mirroring)
+// run purely on the admin x-api-key and never touch /auth/*, which keeps
+// them working when Turnstile gates the auth endpoints.
+//
+// POST /api/v1/admin/users/:id/api-keys
+//
+// The plaintext key is returned exactly once, in this response; there is
+// no admin read-back path by design.
+func (h *AdminAPIKeyHandler) CreateUserAPIKey(c *gin.Context) {
+	userID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid user ID")
+		return
+	}
+
+	var req AdminCreateUserAPIKeyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+
+	key, err := h.apiKeyService.Create(c.Request.Context(), userID, service.CreateAPIKeyRequest{
+		Name:    req.Name,
+		GroupID: req.GroupID,
+	})
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, dto.APIKeyFromService(key))
 }
 
 // AdminUpdateAPIKeyGroupRequest represents the request to update an API key.
