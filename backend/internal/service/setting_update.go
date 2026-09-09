@@ -160,6 +160,22 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	}
 
 	updates := make(map[string]string)
+	if settings.UpstreamModelSyncEnabled != nil {
+		updates[SettingKeyUpstreamModelSyncEnabled] = strconv.FormatBool(*settings.UpstreamModelSyncEnabled)
+	}
+	for key, value := range map[string]*string{
+		SettingKeyUpstreamModelSyncInterval:       settings.UpstreamModelSyncInterval,
+		SettingKeyUpstreamModelSyncAccountTimeout: settings.UpstreamModelSyncAccountTimeout,
+	} {
+		if value == nil {
+			continue
+		}
+		duration, err := parseUpstreamModelSyncDuration(*value)
+		if err != nil {
+			return nil, infraerrors.BadRequest("INVALID_UPSTREAM_MODEL_SYNC_SETTING", fmt.Sprintf("%s: %v", key, err))
+		}
+		updates[key] = duration.String()
+	}
 
 	// 注册设置
 	updates[SettingKeyRegistrationEnabled] = strconv.FormatBool(settings.RegistrationEnabled)

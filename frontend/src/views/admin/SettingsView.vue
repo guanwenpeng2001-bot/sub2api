@@ -203,6 +203,29 @@
 
         <!-- Tab: Gateway -->
         <div v-show="activeTab === 'gateway'" class="space-y-6">
+          <div class="card">
+            <div class="card-header">
+              <h3 class="text-lg font-medium text-gray-900 dark:text-white">{{ t("admin.settings.upstreamModelSync.title") }}</h3>
+              <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">{{ t("admin.settings.upstreamModelSync.description") }}</p>
+            </div>
+            <div class="card-body space-y-4">
+              <div class="flex items-center justify-between">
+                <label for="upstream-model-sync-enabled" class="font-medium text-gray-900 dark:text-white">{{ t("admin.settings.upstreamModelSync.enabled") }}</label>
+                <Toggle id="upstream-model-sync-enabled" v-model="form.upstream_model_sync_enabled" :aria-label="t('admin.settings.upstreamModelSync.enabled')" />
+              </div>
+              <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <div>
+                  <label for="upstream-model-sync-interval" class="input-label">{{ t("admin.settings.upstreamModelSync.interval") }}</label>
+                  <input id="upstream-model-sync-interval" v-model="form.upstream_model_sync_interval" type="text" class="input" placeholder="24h" />
+                </div>
+                <div>
+                  <label for="upstream-model-sync-timeout" class="input-label">{{ t("admin.settings.upstreamModelSync.accountTimeout") }}</label>
+                  <input id="upstream-model-sync-timeout" v-model="form.upstream_model_sync_account_timeout" type="text" class="input" placeholder="120s" />
+                </div>
+              </div>
+              <p class="text-sm text-gray-500 dark:text-gray-400">{{ t("admin.settings.upstreamModelSync.durationHint") }}</p>
+            </div>
+          </div>
           <!-- Overload Cooldown (529) Settings -->
           <div class="card">
             <div
@@ -9493,6 +9516,9 @@ type SettingsForm = Omit<
   | "wechat_connect_mp_enabled"
   | "wechat_connect_mobile_enabled"
 > & {
+  upstream_model_sync_enabled: boolean;
+  upstream_model_sync_interval: string;
+  upstream_model_sync_account_timeout: string;
   /** Form always binds a concrete boolean (SystemSettings marks this optional). */
   channel_monitor_hide_throughput: boolean;
   channel_monitor_show_quota: boolean;
@@ -9580,6 +9606,9 @@ const form = reactive<SettingsForm>({
   doc_url: "",
   home_content: "",
   compact_home_enabled: false,
+  upstream_model_sync_enabled: true,
+  upstream_model_sync_interval: "24h",
+  upstream_model_sync_account_timeout: "120s",
   backend_mode_enabled: false,
   hide_ccs_import_button: false,
   payment_enabled: false,
@@ -11216,6 +11245,9 @@ async function saveSettings() {
       doc_url: form.doc_url,
       home_content: form.home_content,
       compact_home_enabled: form.compact_home_enabled,
+      upstream_model_sync_enabled: form.upstream_model_sync_enabled,
+      upstream_model_sync_interval: form.upstream_model_sync_interval,
+      upstream_model_sync_account_timeout: form.upstream_model_sync_account_timeout,
       backend_mode_enabled: form.backend_mode_enabled,
       hide_ccs_import_button: form.hide_ccs_import_button,
       table_default_page_size: form.table_default_page_size,

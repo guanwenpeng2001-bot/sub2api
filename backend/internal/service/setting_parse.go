@@ -311,7 +311,15 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 			forwardedClientIPHeaders = parsed
 		}
 	}
+	syncConfig, syncErr := resolveUpstreamModelSyncConfig(settings, defaultUpstreamModelSyncConfig())
+	if syncErr != nil {
+		slog.Error("invalid upstream model sync settings", "error", syncErr)
+	}
+	syncInterval, syncTimeout := syncConfig.interval.String(), syncConfig.accountTimeout.String()
 	result := &SystemSettings{
+		UpstreamModelSyncEnabled:               &syncConfig.enabled,
+		UpstreamModelSyncInterval:              &syncInterval,
+		UpstreamModelSyncAccountTimeout:        &syncTimeout,
 		RegistrationEnabled:                    settings[SettingKeyRegistrationEnabled] == "true",
 		EmailVerifyEnabled:                     emailVerifyEnabled,
 		RegistrationEmailSuffixWhitelist:       ParseRegistrationEmailSuffixWhitelist(settings[SettingKeyRegistrationEmailSuffixWhitelist]),

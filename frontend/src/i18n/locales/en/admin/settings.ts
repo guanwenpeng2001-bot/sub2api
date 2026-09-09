@@ -1,5 +1,13 @@
 export default {
     settings: {
+      upstreamModelSync: {
+        title: 'Upstream Model Catalog Sync',
+        description: 'Refreshes discovered model metadata only; newly discovered models are not automatically authorized. Save using the page Save Settings button. Changes reschedule the next cycle; disabling lets the current cycle finish.',
+        enabled: 'Enable periodic catalog sync',
+        interval: 'Sync interval',
+        accountTimeout: 'Timeout per account',
+        durationHint: 'Enter positive durations with units, such as 24h, 30m or 120s. Saved settings override environment variables and survive restarts. Account timeout changes apply to the next cycle.',
+      },
       title: 'System Settings',
       description: 'Manage registration, email verification, default values, and SMTP settings',
       tabs: {

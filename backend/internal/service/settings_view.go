@@ -12,6 +12,9 @@ func firstNonEmpty(values ...string) string {
 }
 
 type SystemSettings struct {
+	UpstreamModelSyncEnabled            *bool   `json:"upstream_model_sync_enabled"`
+	UpstreamModelSyncInterval           *string `json:"upstream_model_sync_interval"`
+	UpstreamModelSyncAccountTimeout     *string `json:"upstream_model_sync_account_timeout"`
 	RegistrationEnabled                 bool
 	EmailVerifyEnabled                  bool
 	RegistrationEmailSuffixWhitelist    []string

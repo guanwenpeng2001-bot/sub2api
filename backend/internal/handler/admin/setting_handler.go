@@ -133,6 +133,9 @@ func (h *SettingHandler) GetSettings(c *gin.Context) {
 	passkeyConfigured, passkeyRPID, passkeyRPOrigins := h.settingService.PasskeyConfiguration()
 
 	payload := dto.SystemSettings{
+		UpstreamModelSyncEnabled:                               settings.UpstreamModelSyncEnabled,
+		UpstreamModelSyncInterval:                              settings.UpstreamModelSyncInterval,
+		UpstreamModelSyncAccountTimeout:                        settings.UpstreamModelSyncAccountTimeout,
 		RegistrationEnabled:                                    settings.RegistrationEnabled,
 		EmailVerifyEnabled:                                     settings.EmailVerifyEnabled,
 		RegistrationEmailSuffixWhitelist:                       settings.RegistrationEmailSuffixWhitelist,

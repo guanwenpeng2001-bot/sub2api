@@ -6,6 +6,12 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/domain"
 )
 
+const (
+	SettingKeyUpstreamModelSyncEnabled        = "upstream_model_sync_enabled"
+	SettingKeyUpstreamModelSyncInterval       = "upstream_model_sync_interval"
+	SettingKeyUpstreamModelSyncAccountTimeout = "upstream_model_sync_account_timeout"
+)
+
 // Status constants
 const (
 	StatusActive   = domain.StatusActive

@@ -22,6 +22,9 @@ import (
 
 // UpdateSettingsRequest 更新设置请求
 type UpdateSettingsRequest struct {
+	UpstreamModelSyncEnabled        *bool   `json:"upstream_model_sync_enabled"`
+	UpstreamModelSyncInterval       *string `json:"upstream_model_sync_interval"`
+	UpstreamModelSyncAccountTimeout *string `json:"upstream_model_sync_account_timeout"`
 	// 注册设置
 	RegistrationEnabled                 bool                         `json:"registration_enabled"`
 	EmailVerifyEnabled                  bool                         `json:"email_verify_enabled"`
@@ -1496,6 +1499,9 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 	}
 
 	settings := &service.SystemSettings{
+		UpstreamModelSyncEnabled:        req.UpstreamModelSyncEnabled,
+		UpstreamModelSyncInterval:       req.UpstreamModelSyncInterval,
+		UpstreamModelSyncAccountTimeout: req.UpstreamModelSyncAccountTimeout,
 		// 系统全局 platform quota 默认值（整体替换语义）
 		DefaultPlatformQuotas:       req.DefaultPlatformQuotas,
 		AccountSchedulingThresholds: req.AccountSchedulingThresholds,
@@ -2256,6 +2262,9 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		DocURL:                                                 updatedSettings.DocURL,
 		HomeContent:                                            updatedSettings.HomeContent,
 		CompactHomeEnabled:                                     updatedSettings.CompactHomeEnabled,
+		UpstreamModelSyncEnabled:                               updatedSettings.UpstreamModelSyncEnabled,
+		UpstreamModelSyncInterval:                              updatedSettings.UpstreamModelSyncInterval,
+		UpstreamModelSyncAccountTimeout:                        updatedSettings.UpstreamModelSyncAccountTimeout,
 		HideCcsImportButton:                                    updatedSettings.HideCcsImportButton,
 		PurchaseSubscriptionEnabled:                            updatedSettings.PurchaseSubscriptionEnabled,
 		PurchaseSubscriptionURL:                                updatedSettings.PurchaseSubscriptionURL,

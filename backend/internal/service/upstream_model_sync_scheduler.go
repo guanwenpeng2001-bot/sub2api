@@ -39,6 +39,10 @@ type UpstreamModelSyncScheduler struct {
 	started      bool
 	stopped      bool
 	cycleMu      sync.Mutex
+	config       upstreamModelSyncConfig
+	settings     *SettingService
+	wake         chan struct{}
+	unsubscribe  func()
 }
 
 // 窄接口：与 upstreamBillingProbeDueAccountLister 同一思路，调度器只需要列举
@@ -52,34 +56,97 @@ const (
 	defaultUpstreamModelSyncAccountTimeout = 120 * time.Second
 )
 
-func upstreamModelSyncEnabled() bool {
-	return !strings.EqualFold(strings.TrimSpace(os.Getenv("UPSTREAM_MODEL_SYNC_ENABLED")), "false")
+type upstreamModelSyncConfig struct {
+	enabled        bool
+	interval       time.Duration
+	accountTimeout time.Duration
 }
 
-func upstreamModelSyncInterval() time.Duration {
-	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("UPSTREAM_MODEL_SYNC_INTERVAL_HOURS"))); err == nil && v > 0 {
-		return time.Duration(v) * time.Hour
-	}
-	return defaultUpstreamModelSyncIntervalHours * time.Hour
+func defaultUpstreamModelSyncConfig() upstreamModelSyncConfig {
+	return upstreamModelSyncConfig{true, defaultUpstreamModelSyncIntervalHours * time.Hour, defaultUpstreamModelSyncAccountTimeout}
 }
 
-func upstreamModelSyncAccountTimeout() time.Duration {
-	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("UPSTREAM_MODEL_SYNC_ACCOUNT_TIMEOUT_SECONDS"))); err == nil && v > 0 {
-		return time.Duration(v) * time.Second
+func parseUpstreamModelSyncDuration(raw string) (time.Duration, error) {
+	value, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("expected a positive duration (for example 24h or 120s), got %q", raw)
 	}
-	return defaultUpstreamModelSyncAccountTimeout
+	return value, nil
+}
+
+func resolveUpstreamModelSyncConfig(values map[string]string, current upstreamModelSyncConfig) (upstreamModelSyncConfig, error) {
+	result := current
+	var diagnostics []error
+	if raw, ok := values[SettingKeyUpstreamModelSyncEnabled]; ok {
+		value, err := strconv.ParseBool(strings.TrimSpace(raw))
+		if err != nil {
+			diagnostics = append(diagnostics, fmt.Errorf("%s: %w", SettingKeyUpstreamModelSyncEnabled, err))
+		} else {
+			result.enabled = value
+		}
+	} else if raw, ok := os.LookupEnv("UPSTREAM_MODEL_SYNC_ENABLED"); ok {
+		value, err := strconv.ParseBool(strings.TrimSpace(raw))
+		if err != nil {
+			diagnostics = append(diagnostics, fmt.Errorf("UPSTREAM_MODEL_SYNC_ENABLED: %w", err))
+		} else {
+			result.enabled = value
+		}
+	}
+	for _, field := range []struct {
+		key, env string
+		unit     time.Duration
+		target   *time.Duration
+	}{
+		{SettingKeyUpstreamModelSyncInterval, "UPSTREAM_MODEL_SYNC_INTERVAL_HOURS", time.Hour, &result.interval},
+		{SettingKeyUpstreamModelSyncAccountTimeout, "UPSTREAM_MODEL_SYNC_ACCOUNT_TIMEOUT_SECONDS", time.Second, &result.accountTimeout},
+	} {
+		raw, present := values[field.key]
+		source := field.key
+		if !present {
+			raw, present = os.LookupEnv(field.env)
+			source = field.env
+			if present {
+				count, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+				if err != nil || count <= 0 || count > int64((1<<63-1)/field.unit) {
+					diagnostics = append(diagnostics, fmt.Errorf("%s: expected a positive integer within duration range, got %q", source, raw))
+					continue
+				}
+				raw = (time.Duration(count) * field.unit).String()
+			}
+		}
+		if present {
+			value, err := parseUpstreamModelSyncDuration(raw)
+			if err != nil {
+				diagnostics = append(diagnostics, fmt.Errorf("%s: %w", source, err))
+			} else {
+				*field.target = value
+			}
+		}
+	}
+	return result, errors.Join(diagnostics...)
 }
 
 func NewUpstreamModelSyncScheduler(
 	accountLister upstreamModelSyncAccountLister,
 	accountTestService *AccountTestService,
 ) *UpstreamModelSyncScheduler {
+	config, err := resolveUpstreamModelSyncConfig(nil, defaultUpstreamModelSyncConfig())
+	if err != nil {
+		slog.Error("invalid upstream model sync environment; scheduler disabled", "error", err)
+		config.enabled = false
+	}
+	return newUpstreamModelSyncScheduler(accountLister, accountTestService, config)
+}
+
+func newUpstreamModelSyncScheduler(accountLister upstreamModelSyncAccountLister, accountTestService *AccountTestService, config upstreamModelSyncConfig) *UpstreamModelSyncScheduler {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &UpstreamModelSyncScheduler{
 		accountLister:      accountLister,
 		accountTestService: accountTestService,
 		parentCtx:          ctx,
 		parentCancel:       cancel,
+		config:             config,
+		wake:               make(chan struct{}, 1),
 	}
 	if accountTestService != nil {
 		s.syncAccount = func(ctx context.Context, account *Account) error {
@@ -98,14 +165,29 @@ func NewUpstreamModelSyncScheduler(
 func ProvideUpstreamModelSyncScheduler(
 	accountRepo AccountRepository,
 	accountTestService *AccountTestService,
+	settings *SettingService,
 ) *UpstreamModelSyncScheduler {
-	svc := NewUpstreamModelSyncScheduler(accountRepo, accountTestService)
+	svc := newUpstreamModelSyncScheduler(accountRepo, accountTestService, defaultUpstreamModelSyncConfig())
+	svc.settings = settings
+	if settings != nil {
+		// These existing listeners are notified after every successful settings write.
+		svc.unsubscribe = settings.SubscribeChannelMonitorRuntime(func() {
+			select {
+			case svc.wake <- struct{}{}:
+			default:
+			}
+		})
+	}
+	if _, err := svc.reloadConfig(); err != nil {
+		slog.Error("load upstream model sync settings; scheduler disabled", "error", err)
+		svc.config.enabled = false
+	}
 	svc.Start()
 	return svc
 }
 
 func (s *UpstreamModelSyncScheduler) Start() {
-	if s == nil || !upstreamModelSyncEnabled() {
+	if s == nil {
 		return
 	}
 	s.mu.Lock()
@@ -127,25 +209,80 @@ func (s *UpstreamModelSyncScheduler) Stop() {
 	if !s.stopped {
 		s.stopped = true
 		s.parentCancel()
+		if s.unsubscribe != nil {
+			s.unsubscribe()
+		}
 	}
 	s.mu.Unlock()
 	s.wg.Wait()
 }
 
+func (s *UpstreamModelSyncScheduler) reloadConfig() (bool, error) {
+	var values map[string]string
+	if s.settings != nil {
+		ctx, cancel := context.WithTimeout(s.parentCtx, 5*time.Second)
+		defer cancel()
+		var err error
+		values, err = s.settings.settingRepo.GetAll(ctx)
+		if err != nil {
+			return false, err
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next, err := resolveUpstreamModelSyncConfig(values, s.config)
+	if err != nil {
+		return false, err
+	}
+	changed := next != s.config
+	s.config = next
+	return changed, nil
+}
+
 func (s *UpstreamModelSyncScheduler) runLoop() {
 	defer s.wg.Done()
-	ticker := time.NewTicker(upstreamModelSyncInterval())
-	defer ticker.Stop()
-	// 启动后不立即跑：账号刚建/刚编辑时探测链路已经同步过一次，首轮等一个周期，
-	// 避免每次进程重启都对所有上游打一轮 /models。
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
+	var ticks <-chan time.Time
+	reset := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		s.mu.Lock()
+		config := s.config
+		s.mu.Unlock()
+		ticks = nil
+		if config.enabled {
+			timer.Reset(config.interval)
+			ticks = timer.C
+		}
+	}
+	reset()
 	for {
 		select {
 		case <-s.parentCtx.Done():
 			return
-		case <-ticker.C:
-			if err := s.RunOnce(s.parentCtx); err != nil {
-				logger.LegacyPrintf("service.upstream_model_sync", "run_once_failed: err=%v", err)
+		case <-s.wake:
+			changed, err := s.reloadConfig()
+			if err != nil {
+				slog.Error("reload upstream model sync settings; keeping current configuration", "error", err)
+			} else if changed {
+				reset()
 			}
+		case <-ticks:
+			// Read pending updates before beginning another cycle, including disable.
+			changed, err := s.reloadConfig()
+			if err != nil {
+				slog.Error("reload upstream model sync settings; deferring cycle", "error", err)
+			} else if !changed {
+				if err := s.RunOnce(s.parentCtx); err != nil {
+					logger.LegacyPrintf("service.upstream_model_sync", "run_once_failed: err=%v", err)
+				}
+			}
+			reset()
 		}
 	}
 }
@@ -162,6 +299,7 @@ func (s *UpstreamModelSyncScheduler) RunOnce(ctx context.Context) error {
 		return context.Canceled
 	}
 	s.wg.Add(1)
+	accountTimeout := s.config.accountTimeout
 	s.mu.Unlock()
 	defer s.wg.Done()
 	ctx, cancel := context.WithCancel(ctx)
@@ -185,7 +323,7 @@ func (s *UpstreamModelSyncScheduler) RunOnce(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		accountCtx, cancel := context.WithTimeout(ctx, upstreamModelSyncAccountTimeout())
+		accountCtx, cancel := context.WithTimeout(ctx, accountTimeout)
 		syncErr := s.syncAccount(accountCtx, account)
 		cancel()
 		if syncErr == nil {

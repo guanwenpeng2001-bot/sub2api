@@ -27,6 +27,9 @@ type CustomEndpoint struct {
 
 // SystemSettings represents the admin settings API response payload.
 type SystemSettings struct {
+	UpstreamModelSyncEnabled            *bool                    `json:"upstream_model_sync_enabled"`
+	UpstreamModelSyncInterval           *string                  `json:"upstream_model_sync_interval"`
+	UpstreamModelSyncAccountTimeout     *string                  `json:"upstream_model_sync_account_timeout"`
 	RegistrationEnabled                 bool                     `json:"registration_enabled"`
 	EmailVerifyEnabled                  bool                     `json:"email_verify_enabled"`
 	RegistrationEmailSuffixWhitelist    []string                 `json:"registration_email_suffix_whitelist"`

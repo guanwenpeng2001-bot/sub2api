@@ -1,5 +1,13 @@
 export default {
     settings: {
+      upstreamModelSync: {
+        title: '上游模型目录同步',
+        description: '仅刷新发现的模型元数据，不自动授权新增模型。通过页面“保存设置”按钮保存。修改后重排下一轮同步；关闭时让在途同步完成。',
+        enabled: '启用周期目录同步',
+        interval: '同步周期',
+        accountTimeout: '单账号超时',
+        durationHint: '请输入带单位的正时长，如 24h、30m 或 120s。保存值优先于环境变量，重启后保留。单账号超时修改从下一轮生效。',
+      },
       title: '系统设置',
       description: '管理注册、邮箱验证、默认值和 SMTP 设置',
       tabs: {
