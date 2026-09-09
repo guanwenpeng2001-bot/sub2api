@@ -28,7 +28,7 @@ func NewAdminAPIKeyHandler(adminService service.AdminService, apiKeyService *ser
 // for a user, admin-side.
 type AdminCreateUserAPIKeyRequest struct {
 	Name    string `json:"name" binding:"required,max=100"`
-	GroupID *int64 `json:"group_id"`
+	GroupID *int64 `json:"group_id" binding:"omitempty,gt=0"`
 }
 
 // CreateUserAPIKey mints an API key for the given user without logging in
@@ -38,11 +38,11 @@ type AdminCreateUserAPIKeyRequest struct {
 //
 // POST /api/v1/admin/users/:id/api-keys
 //
-// The plaintext key is returned exactly once, in this response; there is
-// no admin read-back path by design.
+// The plaintext key is returned in this response and remains available through
+// the existing admin GET /api/v1/admin/users/:id/api-keys endpoint.
 func (h *AdminAPIKeyHandler) CreateUserAPIKey(c *gin.Context) {
 	userID, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
+	if err != nil || userID <= 0 {
 		response.BadRequest(c, "Invalid user ID")
 		return
 	}
