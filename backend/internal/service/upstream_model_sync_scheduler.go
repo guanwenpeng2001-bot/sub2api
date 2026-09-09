@@ -83,7 +83,11 @@ func NewUpstreamModelSyncScheduler(
 	}
 	if accountTestService != nil {
 		s.syncAccount = func(ctx context.Context, account *Account) error {
-			_, err := accountTestService.SyncUpstreamModelCatalog(ctx, account)
+			catalog, err := accountTestService.SyncUpstreamModelCatalog(ctx, account)
+			if catalog != nil && len(catalog.Warnings) > 0 {
+				slog.Warn("upstream model sync partially succeeded",
+					"account_id", account.ID, "status", catalog.Status, "warnings", catalog.Warnings)
+			}
 			return err
 		}
 	}
@@ -120,12 +124,10 @@ func (s *UpstreamModelSyncScheduler) Stop() {
 		return
 	}
 	s.mu.Lock()
-	if s.stopped {
-		s.mu.Unlock()
-		return
+	if !s.stopped {
+		s.stopped = true
+		s.parentCancel()
 	}
-	s.stopped = true
-	s.parentCancel()
 	s.mu.Unlock()
 	s.wg.Wait()
 }
@@ -154,8 +156,24 @@ func (s *UpstreamModelSyncScheduler) RunOnce(ctx context.Context) error {
 	if s == nil || s.accountLister == nil || s.syncAccount == nil {
 		return nil
 	}
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return context.Canceled
+	}
+	s.wg.Add(1)
+	s.mu.Unlock()
+	defer s.wg.Done()
+	ctx, cancel := context.WithCancel(ctx)
+	stopCancel := context.AfterFunc(s.parentCtx, cancel)
+	defer stopCancel()
+	defer cancel()
+
 	s.cycleMu.Lock()
 	defer s.cycleMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	accounts, err := s.accountLister.ListActive(ctx)
 	if err != nil {
@@ -173,7 +191,6 @@ func (s *UpstreamModelSyncScheduler) RunOnce(ctx context.Context) error {
 		if syncErr == nil {
 			continue
 		}
-		failures++
 		// 不支持该平台（如未来新增类型）是结构性的，降级 Info 避免每周期刷 Warn。
 		var upstreamErr *UpstreamModelSyncError
 		if errors.As(syncErr, &upstreamErr) && upstreamErr.Kind == UpstreamModelSyncErrorUnsupported {
@@ -181,11 +198,15 @@ func (s *UpstreamModelSyncScheduler) RunOnce(ctx context.Context) error {
 				"account_id", account.ID, "platform", account.Platform)
 			continue
 		}
+		failures++
 		slog.Warn("upstream model sync failed",
 			"account_id", account.ID,
 			"platform", account.Platform,
 			"error", syncErr,
 		)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if failures > 0 {
 		return fmt.Errorf("upstream model sync: %d/%d accounts failed", failures, len(accounts))

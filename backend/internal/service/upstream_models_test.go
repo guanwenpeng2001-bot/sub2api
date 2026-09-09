@@ -552,7 +552,8 @@ func TestSyncUpstreamModelCatalogUsesConfiguredModelsWhenListEndpointUnsupported
 	require.NoError(t, err)
 	require.Contains(t, account.GetUpstreamModelMetadataSnapshot().Models, "old-live-model", "an unavailable model-list endpoint is not evidence of removal")
 	require.Equal(t, []string{"glm-5.3"}, catalog.Models)
-	require.Empty(t, catalog.Warnings)
+	require.Equal(t, UpstreamModelSyncPartial, catalog.Status)
+	require.Equal(t, "upstream_model_list_unavailable", catalog.Warnings[0].Code)
 	require.Len(t, upstream.requests, 2)
 	require.Equal(t, "https://provider.example/v1/models", upstream.requests[0].URL.String())
 	require.Equal(t, modelsDevRegistryURL, upstream.requests[1].URL.String())
@@ -769,7 +770,7 @@ func TestSyncUpstreamModelCatalogDoesNotOverwriteSnapshotWhenRegistryFails(t *te
 		Code:    UpstreamModelMetadataIncompleteCode,
 		Message: "Model IDs were synced, but capability metadata is incomplete.",
 	}}, catalog.Warnings)
-	require.Nil(t, repo.updates, "a failed metadata enrichment must not erase a previously saved snapshot")
+	require.NotContains(t, repo.updates, UpstreamModelMetadataExtraKey, "a failed metadata enrichment must not erase a previously saved snapshot")
 }
 
 func TestSyncUpstreamModelCatalogDoesNotPersistPartialMetadataWhenRegistryFails(t *testing.T) {
@@ -796,7 +797,7 @@ func TestSyncUpstreamModelCatalogDoesNotPersistPartialMetadataWhenRegistryFails(
 	require.Equal(t, []string{"partially-described-model"}, catalog.Models)
 	require.Equal(t, "Partial Model", catalog.Metadata["partially-described-model"].DisplayName)
 	require.Equal(t, UpstreamModelMetadataIncompleteCode, catalog.Warnings[0].Code)
-	require.Nil(t, repo.updates, "partial metadata must not replace a more complete persisted snapshot")
+	require.NotContains(t, repo.updates, UpstreamModelMetadataExtraKey, "partial metadata must not replace a more complete persisted snapshot")
 }
 
 // Scenario: 图片专用模型缺少 context 时，不阻止 agent 模型能力落库，也不误报整批失败。

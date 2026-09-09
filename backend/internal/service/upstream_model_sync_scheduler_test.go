@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -102,4 +103,92 @@ func TestBuildOpenAIAPIKeyModelsRequest_HeaderOverrideWinsOverUpstreamUserAgent(
 	req, err := buildOpenAIAPIKeyModelsRequest(context.Background(), account, func(s string) (string, error) { return s, nil })
 	require.NoError(t, err)
 	require.Equal(t, "explicit/1.0", req.Header.Get("User-Agent"))
+}
+
+func TestUpstreamModelSyncScheduler_UnsupportedDoesNotCountAsFailure(t *testing.T) {
+	s := NewUpstreamModelSyncScheduler(&upstreamModelSyncListerStub{accounts: []Account{{ID: 1}, {ID: 2}, {ID: 3}}}, nil)
+	defer s.Stop()
+	var visited []int64
+	s.syncAccount = func(_ context.Context, a *Account) error {
+		visited = append(visited, a.ID)
+		if a.ID == 1 {
+			return newUpstreamModelSyncUnsupportedError("unsupported", nil)
+		}
+		if a.ID == 2 {
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+	require.ErrorContains(t, s.RunOnce(context.Background()), "1/3 accounts failed")
+	require.Equal(t, []int64{1, 2, 3}, visited)
+	s.syncAccount = func(context.Context, *Account) error { return newUpstreamModelSyncUnsupportedError("unsupported", nil) }
+	require.NoError(t, s.RunOnce(context.Background()))
+}
+
+func TestUpstreamModelSyncScheduler_AccountTimeoutContinues(t *testing.T) {
+	t.Setenv("UPSTREAM_MODEL_SYNC_ACCOUNT_TIMEOUT_SECONDS", "1")
+	s := NewUpstreamModelSyncScheduler(&upstreamModelSyncListerStub{accounts: []Account{{ID: 1}, {ID: 2}}}, nil)
+	defer s.Stop()
+	var visited []int64
+	s.syncAccount = func(ctx context.Context, a *Account) error {
+		visited = append(visited, a.ID)
+		if a.ID == 1 {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		require.NoError(t, ctx.Err())
+		return nil
+	}
+	require.ErrorContains(t, s.RunOnce(context.Background()), "1/2 accounts failed")
+	require.Equal(t, []int64{1, 2}, visited)
+}
+
+func TestUpstreamModelSyncScheduler_StopCancelsAndWaitsForRunOnce(t *testing.T) {
+	s := NewUpstreamModelSyncScheduler(&upstreamModelSyncListerStub{accounts: []Account{{ID: 1}, {ID: 2}}}, nil)
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	s.syncAccount = func(ctx context.Context, a *Account) error {
+		if a.ID != 1 {
+			return errors.New("unexpected subsequent account")
+		}
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		<-release
+		return ctx.Err()
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- s.RunOnce(context.Background()) }()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("sync did not start")
+	}
+	stops := make(chan struct{}, 2)
+	go func() { s.Stop(); stops <- struct{}{} }()
+	select {
+	case <-canceled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Stop did not cancel sync")
+	}
+	go func() { s.Stop(); stops <- struct{}{} }()
+	select {
+	case <-stops:
+		t.Fatal("Stop returned before sync finished")
+	case <-time.After(20 * time.Millisecond):
+	}
+	release <- struct{}{}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-stops:
+		case <-time.After(3 * time.Second):
+			t.Fatal("Stop did not finish")
+		}
+	}
+	require.ErrorIs(t, <-runDone, context.Canceled)
+	require.ErrorIs(t, s.RunOnce(context.Background()), context.Canceled)
+	s.Start()
+	require.False(t, s.started, "a stopped scheduler must not restart")
 }

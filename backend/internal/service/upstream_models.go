@@ -46,7 +46,23 @@ type UpstreamModelMetadataSnapshot struct {
 	Models   map[string]UpstreamModelMetadata `json:"models"`
 }
 
+type UpstreamModelSyncStatus string
+
+const (
+	UpstreamModelSyncSuccess UpstreamModelSyncStatus = "success"
+	UpstreamModelSyncPartial UpstreamModelSyncStatus = "partial_success"
+	UpstreamModelSyncSkipped UpstreamModelSyncStatus = "skipped"
+	UpstreamModelSyncFailed  UpstreamModelSyncStatus = "failed"
+
+	UpstreamModelSyncStatusExtraKey   = "upstream_model_sync_status"
+	UpstreamModelSyncAttemptExtraKey  = "upstream_model_sync_last_attempt_at"
+	UpstreamModelSyncSuccessExtraKey  = "upstream_model_sync_last_success_at"
+	UpstreamModelSyncCountExtraKey    = "upstream_model_sync_model_count"
+	UpstreamModelSyncWarningsExtraKey = "upstream_model_sync_warnings"
+)
+
 type UpstreamModelCatalog struct {
+	Status   UpstreamModelSyncStatus          `json:"status,omitempty"`
 	Models   []string                         `json:"models"`
 	Metadata map[string]UpstreamModelMetadata `json:"metadata,omitempty"`
 	Warnings []UpstreamModelSyncWarning       `json:"warnings,omitempty"`
@@ -205,14 +221,74 @@ func (s *AccountTestService) FetchUpstreamSupportedModels(ctx context.Context, a
 // when other IDs in the same sync remain incomplete. An incomplete warning is
 // still returned so admins can tell ID sync succeeded without a full capability
 // snapshot. When no model is complete, the existing account snapshot is left
-// untouched.
+// untouched. Both full and partial success advance the last-success timestamp and
+// ID count; failed/skipped attempts preserve them. Status and a new snapshot are
+// persisted together using an extra-key patch.
 func (s *AccountTestService) SyncUpstreamModelCatalog(ctx context.Context, account *Account) (*UpstreamModelCatalog, error) {
+	attemptedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	catalog, snapshot, syncErr := s.syncUpstreamModelCatalog(ctx, account)
+	if syncErr == nil && ctx.Err() != nil {
+		syncErr = newUpstreamModelSyncUpstreamError("Upstream model sync canceled or timed out", ctx.Err())
+	}
+	status := UpstreamModelSyncSuccess
+	var warnings []UpstreamModelSyncWarning
+	if catalog != nil {
+		warnings = catalog.Warnings
+		if len(warnings) > 0 {
+			status = UpstreamModelSyncPartial
+		}
+	}
+	if syncErr != nil {
+		status = UpstreamModelSyncFailed
+		var upstreamErr *UpstreamModelSyncError
+		if errors.As(syncErr, &upstreamErr) && upstreamErr.Kind == UpstreamModelSyncErrorUnsupported {
+			status = UpstreamModelSyncSkipped
+		}
+	}
+	updates := map[string]any{
+		UpstreamModelSyncStatusExtraKey:   string(status),
+		UpstreamModelSyncAttemptExtraKey:  attemptedAt,
+		UpstreamModelSyncWarningsExtraKey: warnings,
+	}
+	if syncErr == nil {
+		updates[UpstreamModelSyncSuccessExtraKey] = time.Now().UTC().Format(time.RFC3339Nano)
+		updates[UpstreamModelSyncCountExtraKey] = len(catalog.Models)
+		if snapshot != nil {
+			updates[UpstreamModelMetadataExtraKey] = *snapshot
+		}
+	}
+	if account != nil && account.ID > 0 && s != nil && s.accountRepo != nil {
+		persistCtx := ctx
+		if syncErr != nil {
+			// Record timeout/cancellation without allowing shutdown to wait indefinitely.
+			var cancel context.CancelFunc
+			persistCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+		}
+		if err := s.accountRepo.UpdateExtra(persistCtx, account.ID, updates); err != nil {
+			return nil, newUpstreamModelSyncInternalError("Failed to save upstream model sync result", errors.Join(syncErr, err))
+		}
+		if account.Extra == nil {
+			account.Extra = make(map[string]any)
+		}
+		for key, value := range updates {
+			account.Extra[key] = value
+		}
+	}
+	if syncErr != nil {
+		return nil, syncErr
+	}
+	catalog.Status = status
+	return catalog, nil
+}
+
+func (s *AccountTestService) syncUpstreamModelCatalog(ctx context.Context, account *Account) (*UpstreamModelCatalog, *UpstreamModelMetadataSnapshot, error) {
 	models, body, err := s.fetchUpstreamModelList(ctx, account)
 	liveListAvailable := err == nil
 	if err != nil {
 		configuredModels := configuredUpstreamModelsForCapabilitySync(account)
 		if !upstreamModelListEndpointUnsupported(err) || len(configuredModels) == 0 {
-			return nil, err
+			return nil, nil, err
 		}
 		models = configuredModels
 		body = nil
@@ -224,6 +300,12 @@ func (s *AccountTestService) SyncUpstreamModelCatalog(ctx context.Context, accou
 		)
 	}
 	catalog := &UpstreamModelCatalog{Models: models, Metadata: make(map[string]UpstreamModelMetadata)}
+	if !liveListAvailable {
+		catalog.Warnings = append(catalog.Warnings, UpstreamModelSyncWarning{
+			Code:    "upstream_model_list_unavailable",
+			Message: "Live model list is unavailable; capabilities were synced for configured models only.",
+		})
+	}
 	if len(body) > 0 {
 		_, directMetadata, parseErr := extractUpstreamModelCatalog(body, account != nil && account.IsGrok())
 		if parseErr == nil {
@@ -261,7 +343,7 @@ func (s *AccountTestService) SyncUpstreamModelCatalog(ctx context.Context, accou
 	}
 
 	completeMetadata := completeUpstreamModelMetadataSubset(capabilityIDs, catalog.Metadata)
-	persistedCapabilities := false
+	var snapshot *UpstreamModelMetadataSnapshot
 	if len(completeMetadata) > 0 && account != nil && account.ID > 0 && s.accountRepo != nil {
 		// Retain known metadata only for models still listed or explicitly mapped.
 		if previous := account.GetUpstreamModelMetadataSnapshot(); previous != nil {
@@ -288,20 +370,15 @@ func (s *AccountTestService) SyncUpstreamModelCatalog(ctx context.Context, accou
 				}
 			}
 		}
-		snapshot := UpstreamModelMetadataSnapshot{
+		snapshot = &UpstreamModelMetadataSnapshot{
 			Source:   source,
 			SyncedAt: time.Now().UTC().Format(time.RFC3339),
 			Models:   completeMetadata,
 		}
-		if err := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{UpstreamModelMetadataExtraKey: snapshot}); err != nil {
-			return nil, newUpstreamModelSyncInternalError("Failed to save upstream model metadata", err)
-		}
-		account.SetUpstreamModelMetadataSnapshot(snapshot)
-		persistedCapabilities = true
 	}
 
 	if upstreamCatalogNeedsRegistry(capabilityIDs, catalog.Metadata) {
-		if persistedCapabilities {
+		if snapshot != nil {
 			catalog.Warnings = append(catalog.Warnings, UpstreamModelSyncWarning{
 				Code:    UpstreamModelMetadataPartialCode,
 				Message: "Some model capabilities were saved; remaining models are still incomplete.",
@@ -313,7 +390,7 @@ func (s *AccountTestService) SyncUpstreamModelCatalog(ctx context.Context, accou
 			})
 		}
 	}
-	return catalog, nil
+	return catalog, snapshot, nil
 }
 
 func upstreamModelSyncStatusCode(err error) int {
