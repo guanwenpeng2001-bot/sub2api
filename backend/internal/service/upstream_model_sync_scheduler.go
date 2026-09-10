@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/google/uuid"
 )
 
 // UpstreamModelSyncScheduler 周期性对所有 active 账号跑上游模型目录同步
@@ -27,6 +28,8 @@ import (
 //	UPSTREAM_MODEL_SYNC_ACCOUNT_TIMEOUT_SECONDS  单账号超时秒数（默认 120）
 type UpstreamModelSyncScheduler struct {
 	accountLister      upstreamModelSyncAccountLister
+	lockCache          LeaderLockCache
+	lockTTL            time.Duration
 	accountTestService *AccountTestService
 
 	// syncAccount 是可替换的同步单元（默认走 AccountTestService），测试可注入假实现。
@@ -48,10 +51,12 @@ type UpstreamModelSyncScheduler struct {
 // 窄接口：与 upstreamBillingProbeDueAccountLister 同一思路，调度器只需要列举
 // active 账号，不依赖整个 AccountRepository。
 type upstreamModelSyncAccountLister interface {
-	ListActive(ctx context.Context) ([]Account, error)
+	ListActiveModelSyncPage(ctx context.Context, afterID int64, limit int) ([]Account, error)
 }
 
 const (
+	upstreamModelSyncPageSize              = 100
+	upstreamModelSyncLeaderKey             = "upstream:model:sync:leader"
 	defaultUpstreamModelSyncIntervalHours  = 24
 	defaultUpstreamModelSyncAccountTimeout = 120 * time.Second
 )
@@ -130,19 +135,23 @@ func resolveUpstreamModelSyncConfig(values map[string]string, current upstreamMo
 func NewUpstreamModelSyncScheduler(
 	accountLister upstreamModelSyncAccountLister,
 	accountTestService *AccountTestService,
+	lockCache LeaderLockCache,
 ) *UpstreamModelSyncScheduler {
 	config, err := resolveUpstreamModelSyncConfig(nil, defaultUpstreamModelSyncConfig())
 	if err != nil {
 		slog.Error("invalid upstream model sync environment; scheduler disabled", "error", err)
 		config.enabled = false
 	}
-	return newUpstreamModelSyncScheduler(accountLister, accountTestService, config)
+	svc := newUpstreamModelSyncScheduler(accountLister, accountTestService, config)
+	svc.lockCache = lockCache
+	return svc
 }
 
 func newUpstreamModelSyncScheduler(accountLister upstreamModelSyncAccountLister, accountTestService *AccountTestService, config upstreamModelSyncConfig) *UpstreamModelSyncScheduler {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &UpstreamModelSyncScheduler{
 		accountLister:      accountLister,
+		lockTTL:            2 * time.Minute,
 		accountTestService: accountTestService,
 		parentCtx:          ctx,
 		parentCancel:       cancel,
@@ -167,9 +176,15 @@ func ProvideUpstreamModelSyncScheduler(
 	accountRepo AccountRepository,
 	accountTestService *AccountTestService,
 	settings *SettingService,
+	lockCache LeaderLockCache,
 ) *UpstreamModelSyncScheduler {
-	svc := newUpstreamModelSyncScheduler(accountRepo, accountTestService, defaultUpstreamModelSyncConfig())
+	lister, ok := accountRepo.(upstreamModelSyncAccountLister)
+	if !ok {
+		panic("account repository must support paginated model sync")
+	}
+	svc := newUpstreamModelSyncScheduler(lister, accountTestService, defaultUpstreamModelSyncConfig())
 	svc.settings = settings
+	svc.lockCache = lockCache
 	if settings != nil {
 		// These existing listeners are notified after every successful settings write.
 		svc.unsubscribe = settings.SubscribeChannelMonitorRuntime(func() {
@@ -337,47 +352,126 @@ func (s *UpstreamModelSyncScheduler) RunOnce(ctx context.Context) error {
 	defer stopCancel()
 	defer cancel()
 
-	s.cycleMu.Lock()
+	// A duplicate trigger is skipped, not queued to run the same scan again.
+	if !s.cycleMu.TryLock() {
+		return nil
+	}
 	defer s.cycleMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	accounts, err := s.accountLister.ListActive(ctx)
+	leaseCtx, release, acquired, err := s.acquireCycleLock(ctx)
 	if err != nil {
-		return fmt.Errorf("list active accounts: %w", err)
+		return err
 	}
-	failures := 0
-	for i := range accounts {
-		account := &accounts[i]
-		if ctx.Err() != nil {
-			return ctx.Err()
+	if !acquired {
+		return nil
+	}
+	defer release()
+	ctx = leaseCtx
+	failures, total := 0, 0
+	var afterID int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		accountCtx, cancel := context.WithTimeout(ctx, accountTimeout)
-		syncErr := s.syncAccount(accountCtx, account)
-		cancel()
-		if syncErr == nil {
-			continue
+		accounts, err := s.accountLister.ListActiveModelSyncPage(ctx, afterID, upstreamModelSyncPageSize)
+		if err != nil {
+			return fmt.Errorf("list active accounts page: %w", err)
 		}
-		// 不支持该平台（如未来新增类型）是结构性的，降级 Info 避免每周期刷 Warn。
-		var upstreamErr *UpstreamModelSyncError
-		if errors.As(syncErr, &upstreamErr) && upstreamErr.Kind == UpstreamModelSyncErrorUnsupported {
-			slog.Info("upstream model sync skipped: platform unsupported",
-				"account_id", account.ID, "platform", account.Platform)
-			continue
+		if len(accounts) == 0 {
+			break
 		}
-		failures++
-		slog.Warn("upstream model sync failed",
-			"account_id", account.ID,
-			"platform", account.Platform,
-			"error", syncErr,
-		)
+		// Guard the cursor contract to avoid an infinite loop with a faulty lister.
+		for i := range accounts {
+			if accounts[i].ID <= afterID {
+				return errors.New("model sync page is not ordered by increasing account ID")
+			}
+			afterID = accounts[i].ID
+		}
+		total += len(accounts)
+		for i := range accounts {
+			account := &accounts[i]
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			accountCtx, cancel := context.WithTimeout(ctx, accountTimeout)
+			syncErr := s.syncAccount(accountCtx, account)
+			cancel()
+			if syncErr == nil {
+				continue
+			}
+			// 不支持该平台（如未来新增类型）是结构性的，降级 Info 避免每周期刷 Warn。
+			var upstreamErr *UpstreamModelSyncError
+			if errors.As(syncErr, &upstreamErr) && upstreamErr.Kind == UpstreamModelSyncErrorUnsupported {
+				slog.Info("upstream model sync skipped: platform unsupported",
+					"account_id", account.ID, "platform", account.Platform)
+				continue
+			}
+			failures++
+			slog.Warn("upstream model sync failed",
+				"account_id", account.ID,
+				"platform", account.Platform,
+				"error", syncErr,
+			)
+		}
+		if len(accounts) < upstreamModelSyncPageSize {
+			break
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+
 	if failures > 0 {
-		return fmt.Errorf("upstream model sync: %d/%d accounts failed", failures, len(accounts))
+		return fmt.Errorf("upstream model sync: %d/%d accounts failed", failures, total)
 	}
 	return nil
+}
+
+// acquireCycleLock requires coordination even on a single instance: old and new
+// processes may overlap during a restart. An unavailable lock fails closed.
+func (s *UpstreamModelSyncScheduler) acquireCycleLock(ctx context.Context) (context.Context, func(), bool, error) {
+	cache, ok := s.lockCache.(RenewableLeaderLockCache)
+	if !ok {
+		return ctx, nil, false, errors.New("model sync requires a renewable leader lock")
+	}
+	owner := uuid.NewString()
+	lockCtx, lockCancel := context.WithTimeout(ctx, 2*time.Second)
+	acquired, err := cache.TryAcquireLeaderLock(lockCtx, upstreamModelSyncLeaderKey, owner, s.lockTTL)
+	lockCancel()
+	if err != nil || !acquired {
+		return ctx, nil, false, err
+	}
+	leaseCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(s.lockTTL / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-leaseCtx.Done():
+				return
+			case <-ticker.C:
+				renewCtx, renewCancel := context.WithTimeout(leaseCtx, min(2*time.Second, s.lockTTL/3))
+				renewed, renewErr := cache.RenewLeaderLock(renewCtx, upstreamModelSyncLeaderKey, owner, s.lockTTL)
+				renewCancel()
+				if renewErr != nil || !renewed {
+					slog.Warn("upstream model sync lost leader lock", "error", renewErr)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	release := func() {
+		cancel()
+		<-done
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer releaseCancel()
+		_ = cache.ReleaseLeaderLock(releaseCtx, upstreamModelSyncLeaderKey, owner)
+	}
+	return leaseCtx, release, true, nil
 }

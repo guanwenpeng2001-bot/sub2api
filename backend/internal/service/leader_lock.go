@@ -18,6 +18,13 @@ type LeaderLockCache interface {
 	ReleaseLeaderLock(ctx context.Context, key, owner string) error
 }
 
+// RenewableLeaderLockCache extends ownership checks to long-running jobs.
+// Renewal must compare the owner and extend the TTL atomically.
+type RenewableLeaderLockCache interface {
+	LeaderLockCache
+	RenewLeaderLock(ctx context.Context, key, owner string, ttl time.Duration) (bool, error)
+}
+
 // tryAcquireSingletonLeaderLock provides best-effort single-flight execution of a
 // periodic background job across multiple instances. It prefers the Redis-backed
 // LeaderLockCache and falls back to a Postgres advisory lock when the cache is

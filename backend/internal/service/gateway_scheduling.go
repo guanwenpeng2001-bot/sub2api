@@ -141,7 +141,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 	}
 
 	// [DEBUG-STICKY] 调度器入口日志
-	slog.Info("sticky.scheduler_entry",
+	slog.Debug("sticky.scheduler_entry",
 		"group_id", derefGroupID(groupID),
 		"session_hash", shortSessionHash(sessionHash),
 		"sticky_account_id", stickyAccountID,
@@ -1895,8 +1895,11 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 
 	// require_privacy_set: 获取分组信息
 	var schedGroup *Group
-	if groupID != nil && s.groupRepo != nil {
-		schedGroup, _ = s.groupRepo.GetByID(ctx, *groupID)
+	if groupID != nil {
+		schedGroup = s.groupFromContext(ctx, *groupID)
+		if schedGroup == nil && s.groupRepo != nil {
+			schedGroup, _ = s.resolveGroupByID(ctx, *groupID)
+		}
 	}
 
 	var accounts []Account
@@ -2161,8 +2164,11 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 
 	// require_privacy_set: 获取分组信息
 	var schedGroup *Group
-	if groupID != nil && s.groupRepo != nil {
-		schedGroup, _ = s.groupRepo.GetByID(ctx, *groupID)
+	if groupID != nil {
+		schedGroup = s.groupFromContext(ctx, *groupID)
+		if schedGroup == nil && s.groupRepo != nil {
+			schedGroup, _ = s.resolveGroupByID(ctx, *groupID)
+		}
 	}
 
 	var accounts []Account

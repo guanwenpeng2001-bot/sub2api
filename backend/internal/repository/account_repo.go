@@ -1220,6 +1220,36 @@ func (r *accountRepository) ListActive(ctx context.Context) ([]service.Account, 
 	return r.accountsToService(ctx, accounts)
 }
 
+// ListActiveModelSyncPage uses a stable ID cursor: status changes and deletes
+// between pages cannot shift offsets and skip the following accounts.
+func (r *accountRepository) ListActiveModelSyncPage(ctx context.Context, afterID int64, limit int) ([]service.Account, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	accounts, err := r.client.Account.Query().Where(
+		dbaccount.StatusEQ(service.StatusActive),
+		dbaccount.IDGT(afterID),
+		dbaccount.Or(
+			dbaccount.And(
+				dbaccount.PlatformIn(service.PlatformOpenAI, service.PlatformGrok, service.PlatformGemini),
+				dbaccount.TypeIn(service.AccountTypeAPIKey, service.AccountTypeOAuth),
+			),
+			dbaccount.And(
+				dbaccount.PlatformEQ(service.PlatformAnthropic),
+				dbaccount.TypeIn(service.AccountTypeAPIKey, service.AccountTypeOAuth, service.AccountTypeSetupToken),
+			),
+			dbaccount.And(
+				dbaccount.PlatformIn(service.PlatformAntigravity, service.PlatformKimi, service.PlatformZhipu, service.PlatformDeepseek, service.PlatformMiniMax),
+				dbaccount.TypeEQ(service.AccountTypeAPIKey),
+			),
+		),
+	).Order(dbent.Asc(dbaccount.FieldID)).Limit(limit).All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return r.accountsToService(ctx, accounts)
+}
+
 func (r *accountRepository) ListOAuthRefreshCandidatePage(ctx context.Context, options service.OAuthRefreshPageOptions) (*service.OAuthRefreshCandidatePage, error) {
 	if r.sql == nil {
 		return nil, errors.New("account repository SQL executor not configured")
@@ -1919,6 +1949,54 @@ func (r *accountRepository) ListSchedulable(ctx context.Context) ([]service.Acco
 		return nil, err
 	}
 	return r.accountsToService(ctx, accounts)
+}
+
+// ListModelDiscoveryAccounts is the lean fallback for unscoped model discovery.
+// JSON projection happens in SQL; secrets, proxy records and group edges never
+// cross the database connection. Predicates match the schedulable list contract.
+func (r *accountRepository) ListModelDiscoveryAccounts(ctx context.Context, groupID *int64, platform string) ([]service.Account, error) {
+	if r.sql == nil {
+		return nil, errors.New("account repository SQL executor not configured")
+	}
+	var group any
+	if groupID != nil {
+		group = *groupID
+	}
+	rows, err := r.sql.QueryContext(ctx, `
+SELECT a.id, a.platform, a.type,
+ jsonb_build_object('model_mapping', a.credentials->'model_mapping',
+  'oauth_type', a.credentials->'oauth_type', 'project_id', a.credentials->'project_id')::text,
+ jsonb_build_object('openai_passthrough', a.extra->'openai_passthrough',
+  'openai_oauth_passthrough', a.extra->'openai_oauth_passthrough')::text
+FROM accounts a
+WHERE a.deleted_at IS NULL AND a.status = 'active' AND a.schedulable = TRUE
+ AND (a.temp_unschedulable_until IS NULL OR a.temp_unschedulable_until <= NOW())
+ AND (a.expires_at IS NULL OR a.expires_at > NOW() OR a.auto_pause_on_expired = FALSE)
+ AND (a.overload_until IS NULL OR a.overload_until <= NOW())
+ AND (a.rate_limit_reset_at IS NULL OR a.rate_limit_reset_at <= NOW())
+ AND ($1::bigint IS NULL OR EXISTS (SELECT 1 FROM account_groups ag WHERE ag.account_id = a.id AND ag.group_id = $1))
+ AND ($2::text = '' OR a.platform = $2)
+ORDER BY a.id`, group, platform)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	accounts := make([]service.Account, 0)
+	for rows.Next() {
+		var account service.Account
+		var credentials, extra []byte
+		if err := rows.Scan(&account.ID, &account.Platform, &account.Type, &credentials, &extra); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(credentials, &account.Credentials); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(extra, &account.Extra); err != nil {
+			return nil, err
+		}
+		accounts = append(accounts, account)
+	}
+	return accounts, rows.Err()
 }
 
 func (r *accountRepository) ListSchedulableAccountLoads(ctx context.Context) ([]service.AccountWithConcurrency, error) {

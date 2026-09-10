@@ -312,7 +312,8 @@ func (a *Account) GetUpstreamUserAgent() string {
 	return ua
 }
 
-// ApplyUpstreamUserAgent 把账号的上游 User-Agent 写进请求头。调用顺序约定：
+// ApplyUpstreamUserAgent 仅把账号的管理探测／目录同步 User-Agent 写进请求头，
+// 不用于真实聊天转发；探测结果不保证与真实转发的客户端契约一致。调用顺序约定：
 // 先本方法、后 ApplyHeaderOverrides——credentials.header_overrides 里的显式
 // user-agent 条目优先于 extra.upstream_user_agent。
 func (a *Account) ApplyUpstreamUserAgent(h http.Header) {

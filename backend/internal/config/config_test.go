@@ -2080,7 +2080,7 @@ func TestValidateConfigErrors(t *testing.T) {
 		},
 		{
 			name:    "gateway models list cache ttl range",
-			mutate:  func(c *Config) { c.Gateway.ModelsListCacheTTLSeconds = 31 },
+			mutate:  func(c *Config) { c.Gateway.ModelsListCacheTTLSeconds = 61 },
 			wantErr: "gateway.models_list_cache_ttl_seconds",
 		},
 		{
@@ -2637,4 +2637,12 @@ func TestLoadAPIKeyIdempotencyHMACSecret(t *testing.T) {
 	cfg, err := Load()
 	require.NoError(t, err)
 	require.Equal(t, "independent-mint-secret", cfg.APIKeyIdemHMACSecret)
+}
+
+func TestLoadDefaultModelsListCacheCoversDiscoveryRefresh(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.Equal(t, 60, cfg.Gateway.ModelsListCacheTTLSeconds)
+	require.NoError(t, cfg.Validate())
 }

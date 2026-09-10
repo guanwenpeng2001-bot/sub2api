@@ -58,7 +58,7 @@ IMPORTANT: You must NEVER generate or guess URLs for the user unless you are con
 	maxCacheControlBlocks = 4 // Anthropic API 允许的最大 cache_control 块数量
 
 	defaultUserGroupRateCacheTTL           = 30 * time.Second
-	defaultModelsListCacheTTL              = 15 * time.Second
+	defaultModelsListCacheTTL              = 60 * time.Second
 	postUsageBillingTimeout                = 15 * time.Second
 	claudeCodeNoopDeltaKeepaliveMinVersion = "2.1.193"
 	debugGatewayBodyEnv                    = "SUB2API_DEBUG_GATEWAY_BODY"
@@ -1375,6 +1375,31 @@ func (s *GatewayService) DoGrokNativeResponsesJSON(ctx context.Context, account 
 	return respBytes, nil
 }
 
+// listModelDiscoveryAccounts shares the lean source across platform listings
+// and composite discovery. Legacy repositories remain usable by embedded tests.
+func (s *GatewayService) listModelDiscoveryAccounts(ctx context.Context, groupID *int64, platform string) ([]Account, error) {
+	var accounts []Account
+	var err error
+
+	if s.schedulerSnapshot != nil && platform != "" && groupID != nil && *groupID > 0 {
+		// Read model_mapping from scheduler metadata without hydrating account rows.
+		// Force the platform bucket so discovery does not add mixed-platform models.
+		accounts, _, err = s.schedulerSnapshot.ListSchedulableAccounts(ctx, groupID, platform, true)
+	} else if projection, ok := s.accountRepo.(interface {
+		ListModelDiscoveryAccounts(context.Context, *int64, string) ([]Account, error)
+	}); ok {
+		// Unscoped discovery and deployments without snapshots still avoid
+		// full credentials and proxy/group hydration.
+		accounts, err = projection.ListModelDiscoveryAccounts(ctx, groupID, platform)
+	} else if groupID != nil {
+		accounts, err = s.accountRepo.ListSchedulableByGroupID(ctx, *groupID)
+	} else {
+		accounts, err = s.accountRepo.ListSchedulable(ctx)
+	}
+
+	return accounts, err
+}
+
 func (s *GatewayService) GetAvailableModels(ctx context.Context, groupID *int64, platform string) []string {
 	cacheKey := modelsListCacheKey(groupID, platform)
 	if s.modelsListCache != nil {
@@ -1387,14 +1412,7 @@ func (s *GatewayService) GetAvailableModels(ctx context.Context, groupID *int64,
 	}
 	modelsListCacheMissTotal.Add(1)
 
-	var accounts []Account
-	var err error
-
-	if groupID != nil {
-		accounts, err = s.accountRepo.ListSchedulableByGroupID(ctx, *groupID)
-	} else {
-		accounts, err = s.accountRepo.ListSchedulable(ctx)
-	}
+	accounts, err := s.listModelDiscoveryAccounts(ctx, groupID, platform)
 
 	if err != nil || len(accounts) == 0 {
 		return nil
@@ -1523,23 +1541,33 @@ func (s *GatewayService) GetSchedulablePlatforms(ctx context.Context, groupID *i
 	if s == nil || s.accountRepo == nil {
 		return platforms
 	}
-
-	var accounts []Account
-	var err error
-	if groupID != nil {
-		accounts, err = s.accountRepo.ListSchedulableByGroupID(ctx, *groupID)
-	} else {
-		accounts, err = s.accountRepo.ListSchedulable(ctx)
+	cacheKey := fmt.Sprintf("models-platforms|%d|", derefGroupID(groupID))
+	if s.modelsListCache != nil {
+		if cached, found := s.modelsListCache.Get(cacheKey); found {
+			if names, ok := cached.([]string); ok {
+				for _, name := range names {
+					platforms[name] = struct{}{}
+				}
+				return platforms
+			}
+		}
 	}
+	accounts, err := s.listModelDiscoveryAccounts(ctx, groupID, "")
 	if err != nil {
 		return platforms
 	}
-
+	var names []string
 	for _, acc := range accounts {
 		platform := strings.TrimSpace(acc.Platform)
 		if platform != "" {
+			if _, exists := platforms[platform]; !exists {
+				names = append(names, platform)
+			}
 			platforms[platform] = struct{}{}
 		}
+	}
+	if s.modelsListCache != nil {
+		s.modelsListCache.Set(cacheKey, names, s.modelsListCacheTTL)
 	}
 	return platforms
 }
@@ -1549,6 +1577,7 @@ func (s *GatewayService) InvalidateAvailableModelsCache(groupID *int64, platform
 		return
 	}
 	s.invalidateCompositeModelOwnershipCache(groupID)
+	s.invalidateGroupModelCache(groupID, "models-platforms|")
 
 	normalizedPlatform := strings.TrimSpace(platform)
 	// 完整匹配时精准失效；否则按维度批量失效。
@@ -1578,15 +1607,19 @@ func (s *GatewayService) InvalidateAvailableModelsCache(groupID *int64, platform
 }
 
 func (s *GatewayService) invalidateCompositeModelOwnershipCache(groupID *int64) {
+	s.invalidateGroupModelCache(groupID, compositeModelOwnershipCachePrefix)
+}
+
+func (s *GatewayService) invalidateGroupModelCache(groupID *int64, prefix string) {
 	for key := range s.modelsListCache.Items() {
-		if !strings.HasPrefix(key, compositeModelOwnershipCachePrefix) {
+		if !strings.HasPrefix(key, prefix) {
 			continue
 		}
 		if groupID == nil {
 			s.modelsListCache.Delete(key)
 			continue
 		}
-		parts := strings.SplitN(strings.TrimPrefix(key, compositeModelOwnershipCachePrefix), "|", 2)
+		parts := strings.SplitN(strings.TrimPrefix(key, prefix), "|", 2)
 		if len(parts) != 2 {
 			continue
 		}
