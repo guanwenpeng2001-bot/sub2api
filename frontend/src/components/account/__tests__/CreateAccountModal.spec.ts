@@ -284,6 +284,53 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     expect(wrapper.find('[data-testid="create-openai-ws-mode"]').exists()).toBe(true)
   })
 
+  it.each(['  codex_cli_rs/0.153.4  ', '', 'a'.repeat(200), '界'.repeat(66) + 'ab'])(
+    'saves or omits management UA while preserving other extra: %s', async (value) => {
+      const wrapper = mountModal()
+      await selectButtonByText(wrapper, 'OpenAI')
+      await selectButtonByText(wrapper, 'API Key')
+      await wrapper.get('form#create-account-form input[type="text"]').setValue('UA account')
+      await wrapper.get('form#create-account-form input[type="password"]').setValue('test-api-key')
+      await wrapper.get('[data-testid="upstream-request-id-header"]').setValue('X-Request-ID')
+      await wrapper.get('[data-testid="upstream-user-agent"]').setValue(value)
+      await wrapper.get('form#create-account-form').trigger('submit.prevent')
+      await flushPromises()
+      expect(createAccountMock).toHaveBeenCalledTimes(1)
+      expect(createAccountMock.mock.calls[0][0].extra).toMatchObject({
+        upstream_request_id_header: 'X-Request-ID',
+        openai_long_context_billing_enabled: false,
+      })
+      expect(createAccountMock.mock.calls[0][0].extra.upstream_user_agent).toBe(value.trim() || undefined)
+    }
+  )
+
+  it.each(['a'.repeat(201), '界'.repeat(67), 'bad\tvalue', 'bad\u007fvalue'])(
+    'rejects illegal UA before creating an account: %s', async (value) => {
+      const wrapper = mountModal()
+      await selectButtonByText(wrapper, 'OpenAI')
+      await selectButtonByText(wrapper, 'API Key')
+      await wrapper.get('form#create-account-form input[type="text"]').setValue('UA account')
+      await wrapper.get('form#create-account-form input[type="password"]').setValue('test-api-key')
+      await wrapper.get('[data-testid="upstream-user-agent"]').setValue(value)
+      await wrapper.get('form#create-account-form').trigger('submit.prevent')
+      await flushPromises()
+      expect(createAccountMock).not.toHaveBeenCalled()
+      expect(wrapper.get('[data-testid="upstream-user-agent"]').attributes('aria-invalid')).toBe('true')
+    }
+  )
+
+  it('carries management UA through Codex session import', async () => {
+    const wrapper = mountModal()
+    await selectButtonByText(wrapper, 'OpenAI')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('Codex import')
+    await wrapper.get('[data-testid="upstream-user-agent"]').setValue('codex_cli_rs/0.153.4')
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await wrapper.get('[data-testid="import-codex-session"]').trigger('click')
+    await flushPromises()
+    expect(importCodexSessionMock).toHaveBeenCalledTimes(1)
+    expect(importCodexSessionMock.mock.calls[0][0].extra.upstream_user_agent).toBe('codex_cli_rs/0.153.4')
+  })
+
   it('sends false explicitly for normal OpenAI account creation by default', async () => {
     await submitApiKeyAccount('openai')
 

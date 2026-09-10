@@ -2935,6 +2935,22 @@
         <ProxySelector v-model="form.proxy_id" :proxies="proxies" />
       </div>
 
+      <div>
+        <label for="CreateAccountModal-upstream-user-agent" class="input-label">{{ t('admin.accounts.upstreamUserAgent') }}</label>
+        <input
+          id="CreateAccountModal-upstream-user-agent"
+          v-model="upstreamUserAgent"
+          type="text"
+          class="input"
+          data-testid="upstream-user-agent"
+          :placeholder="t('admin.accounts.upstreamUserAgentPlaceholder')"
+          :aria-invalid="!!upstreamUserAgentError"
+          @paste="handleUpstreamUserAgentPaste"
+        />
+        <p class="input-hint">{{ t('admin.accounts.upstreamUserAgentHint') }}</p>
+        <p v-if="upstreamUserAgentError" class="mt-1 text-sm text-red-500">{{ t(upstreamUserAgentError) }}</p>
+      </div>
+
       <UpstreamRequestIdHeaderField
         v-model="upstreamRequestIdHeader"
         :platform="form.platform"
@@ -3815,6 +3831,7 @@
 </template>
 
 <script setup lang="ts">
+import { validateUpstreamUserAgent, withUpstreamUserAgent } from './upstreamUserAgent'
 import { ref, reactive, computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
@@ -3931,12 +3948,25 @@ const oauthStepTitle = computed(() => {
 })
 
 // Platform-specific hints for API Key type
+const upstreamUserAgent = ref('')
+const upstreamUserAgentError = computed(() => validateUpstreamUserAgent(upstreamUserAgent.value))
+const handleUpstreamUserAgentPaste = (event: ClipboardEvent) => {
+  const pasted = event.clipboardData?.getData('text')
+  const error = pasted ? validateUpstreamUserAgent(pasted) : null
+  if (error) {
+    event.preventDefault()
+    appStore.showError(t(error))
+  }
+}
 // 上游ID：直接上游声明请求标识的响应头名，留空不记录。
 const upstreamRequestIdHeader = ref('')
-const withUpstreamRequestIdHeader = <T extends Record<string, unknown> | undefined>(extra: T): T | Record<string, unknown> => {
+const withUpstreamRequestIdHeader = (extra: Record<string, unknown> | undefined): Record<string, unknown> | undefined => {
   const name = upstreamRequestIdHeader.value.trim()
-  if (!name) return extra
-  return { ...(extra || {}), upstream_request_id_header: name }
+  const error = upstreamUserAgentError.value
+  if (error) throw new Error(t(error))
+  const merged = withUpstreamUserAgent(extra, upstreamUserAgent.value)
+  if (name) merged.upstream_request_id_header = name
+  return Object.keys(merged).length > 0 ? merged : undefined
 }
 
 const baseUrlHint = computed(() => {
@@ -5184,6 +5214,7 @@ const resetForm = () => {
   apiKeyBaseUrl.value = 'https://api.anthropic.com'
   apiKeyValue.value = ''
   upstreamRequestIdHeader.value = ''
+  upstreamUserAgent.value = ''
   upstreamBillingAutoProbeEnabled.value = true
   editQuotaLimit.value = null
   editQuotaDailyLimit.value = null
@@ -5487,6 +5518,10 @@ const handleVertexServiceAccountDrop = async (event: DragEvent) => {
 }
 
 const handleSubmit = async () => {
+  if (upstreamUserAgentError.value) {
+    appStore.showError(t(upstreamUserAgentError.value))
+    return
+  }
   // For OAuth-based type, handle OAuth flow (goes to step 2)
   if (isOAuthFlow.value) {
     if (!isGrokSSOInputMethod.value && !form.name.trim()) {

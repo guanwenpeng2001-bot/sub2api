@@ -1,5 +1,10 @@
 export default {
     accounts: {
+      upstreamUserAgent: 'Management upstream User-Agent',
+      upstreamUserAgentPlaceholder: 'Leave empty to clear the account setting',
+      upstreamUserAgentHint: 'Applies only to connected management probes (including Responses capability probes) and manual/periodic model catalog sync. Explicit credentials.header_overrides take priority. This setting does not change real chat forwarding User-Agent. Maximum 200 UTF-8 bytes after trimming surrounding whitespace.',
+      upstreamUserAgentControlCharacters: 'User-Agent must not contain control characters.',
+      upstreamUserAgentTooLong: 'User-Agent must not exceed 200 UTF-8 bytes.',
       title: 'Account Management',
       description: 'Manage AI platform accounts and credentials',
       createAccount: 'Create Account',

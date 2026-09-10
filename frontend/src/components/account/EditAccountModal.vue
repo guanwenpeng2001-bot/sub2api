@@ -1594,6 +1594,22 @@
         <ProxySelector v-model="form.proxy_id" :proxies="proxies" />
       </div>
 
+      <div>
+        <label for="EditAccountModal-upstream-user-agent" class="input-label">{{ t('admin.accounts.upstreamUserAgent') }}</label>
+        <input
+          id="EditAccountModal-upstream-user-agent"
+          v-model="upstreamUserAgent"
+          type="text"
+          class="input"
+          data-testid="upstream-user-agent"
+          :placeholder="t('admin.accounts.upstreamUserAgentPlaceholder')"
+          :aria-invalid="!!upstreamUserAgentError"
+          @paste="handleUpstreamUserAgentPaste"
+        />
+        <p class="input-hint">{{ t('admin.accounts.upstreamUserAgentHint') }}</p>
+        <p v-if="upstreamUserAgentError" class="mt-1 text-sm text-red-500">{{ t(upstreamUserAgentError) }}</p>
+      </div>
+
       <UpstreamRequestIdHeaderField
         v-model="upstreamRequestIdHeader"
         :platform="account.platform"
@@ -2962,6 +2978,7 @@
 </template>
 
 <script setup lang="ts">
+import { validateUpstreamUserAgent, withUpstreamUserAgent } from './upstreamUserAgent'
 import { ref, reactive, computed, watch, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
@@ -3355,6 +3372,16 @@ const autoResetCredit7dThreshold = ref(100)
 const upstreamBillingAutoProbeEnabled = ref(false)
 const upstreamBillingRateSyncEnabled = ref(false)
 const mixedScheduling = ref(false) // For antigravity accounts: enable mixed scheduling
+const upstreamUserAgent = ref('')
+const upstreamUserAgentError = computed(() => validateUpstreamUserAgent(upstreamUserAgent.value))
+const handleUpstreamUserAgentPaste = (event: ClipboardEvent) => {
+  const pasted = event.clipboardData?.getData('text')
+  const error = pasted ? validateUpstreamUserAgent(pasted) : null
+  if (error) {
+    event.preventDefault()
+    appStore.showError(t(error))
+  }
+}
 // 上游ID：直接上游声明请求标识的响应头名，留空不记录。
 const upstreamRequestIdHeader = ref('')
 const readUpstreamRequestIdHeader = (extra: unknown): string => {
@@ -3885,6 +3912,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
 	mixedScheduling.value = extra?.mixed_scheduling === true
 	allowOverages.value = extra?.allow_overages === true
 	upstreamRequestIdHeader.value = readUpstreamRequestIdHeader(extra)
+	upstreamUserAgent.value = typeof extra?.upstream_user_agent === 'string' ? extra.upstream_user_agent : ''
 	openAIImagesUrlToB64JsonEnabled.value = extra?.images_url_to_b64_json === true
 	autoPause5hThreshold.value = typeof extra?.auto_pause_5h_threshold === 'number' ? extra.auto_pause_5h_threshold * 100 : null
 	autoPause7dThreshold.value = typeof extra?.auto_pause_7d_threshold === 'number' ? extra.auto_pause_7d_threshold * 100 : null
@@ -4846,6 +4874,10 @@ const submitUpdateAccount = async (accountID: number, updatePayload: Record<stri
 }
 
 const handleSubmit = async () => {
+  if (upstreamUserAgentError.value) {
+    appStore.showError(t(upstreamUserAgentError.value))
+    return
+  }
   if (!props.account) return
   const accountID = props.account.id
 
@@ -5555,6 +5587,13 @@ const handleSubmit = async () => {
       // Quota notify config
       writeQuotaNotifyToExtra(newExtra, 'update')
       updatePayload.extra = newExtra
+    }
+
+    if (upstreamUserAgent.value.trim() !== (props.account.extra?.upstream_user_agent ?? '')) {
+      updatePayload.extra = withUpstreamUserAgent(
+        (updatePayload.extra as Record<string, unknown> | undefined) || props.account.extra,
+        upstreamUserAgent.value
+      )
     }
 
     // 上游ID头名只在改动时写回 extra，避免用弹窗打开时的快照覆盖运行态键。

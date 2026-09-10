@@ -1,5 +1,10 @@
 export default {
     accounts: {
+      upstreamUserAgent: '管理面上游 User-Agent',
+      upstreamUserAgentPlaceholder: '留空清除账号配置',
+      upstreamUserAgentHint: '仅用于当前已接入的管理探测（包括 Responses 能力探测）及手动／周期模型目录同步；显式 credentials.header_overrides 优先。本字段不改变真实聊天转发的 User-Agent。去除首尾空白后最多 200 个 UTF-8 字节。',
+      upstreamUserAgentControlCharacters: 'User-Agent 不能包含控制字符。',
+      upstreamUserAgentTooLong: 'User-Agent 不能超过 200 个 UTF-8 字节。',
       title: '账号管理',
       description: '管理 AI 平台账号和 Cookie',
       createAccount: '添加账号',

@@ -765,6 +765,42 @@ describe('EditAccountModal', () => {
     )
   })
 
+  it.each(['new-agent', '', '   '])('updates or clears management UA without losing extra: %s', async (value) => {
+    const account = buildAccount()
+    account.extra = { upstream_user_agent: 'old-agent', unrelated: { keep: true }, upstream_request_id_header: 'X-Request-ID' }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    expect(wrapper.get<HTMLInputElement>('[data-testid="upstream-user-agent"]').element.value).toBe('old-agent')
+    await wrapper.get('[data-testid="upstream-user-agent"]').setValue(value)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock).toHaveBeenCalledTimes(1)
+    const extra = updateAccountMock.mock.calls[0][1].extra
+    expect(extra).toMatchObject({ unrelated: { keep: true }, upstream_request_id_header: 'X-Request-ID' })
+    expect(extra.upstream_user_agent).toBe(value.trim() || undefined)
+    expect(account.extra.upstream_user_agent).toBe('old-agent')
+  })
+
+  it.each(['a'.repeat(201), '界'.repeat(67), 'bad\tvalue', 'bad\u007fvalue'])(
+    'rejects illegal management UA before update: %s', async (value) => {
+      const account = buildAccount()
+      updateAccountMock.mockReset().mockResolvedValue(account)
+      const wrapper = mountModal(account)
+      await wrapper.get('[data-testid="upstream-user-agent"]').setValue(value)
+      await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+      expect(updateAccountMock).not.toHaveBeenCalled()
+      expect(wrapper.get('[data-testid="upstream-user-agent"]').attributes('aria-invalid')).toBe('true')
+    }
+  )
+
+  it('blocks pasted newlines before the text input can strip them', async () => {
+    const wrapper = mountModal()
+    const event = new Event('paste', { cancelable: true, bubbles: true })
+    Object.defineProperty(event, 'clipboardData', { value: { getData: () => 'bad' + String.fromCharCode(13, 10) + 'value' } })
+    wrapper.get('[data-testid="upstream-user-agent"]').element.dispatchEvent(event)
+    expect(event.defaultPrevented).toBe(true)
+  })
+
   it('writes the upstream request id header into extra only when it changes', async () => {
     const account = buildAccount()
     account.extra = { openai_compact_mode: 'force_on' }
