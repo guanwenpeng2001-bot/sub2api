@@ -263,3 +263,20 @@ func TestBulkUpdateAcceptsDedicatedUpstreamBillingProbeSetting(t *testing.T) {
 	require.NotNil(t, adminSvc.lastBulkUpdateAccountInput.ProbeEnabled)
 	require.False(t, *adminSvc.lastBulkUpdateAccountInput.ProbeEnabled)
 }
+
+func TestAccountHandlerUpdateMapsDedicatedUserAgent(t *testing.T) {
+	for _, ua := range []string{"new-agent", ""} {
+		adminSvc := newStubAdminService()
+		router := setupAccountMixedChannelRouter(adminSvc)
+		body, err := json.Marshal(map[string]any{"upstream_user_agent": ua})
+		require.NoError(t, err)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/accounts/42", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusOK, rec.Code)
+		require.NotNil(t, adminSvc.lastUpdateAccountInput.UpstreamUserAgent)
+		require.Equal(t, ua, *adminSvc.lastUpdateAccountInput.UpstreamUserAgent)
+		require.Nil(t, adminSvc.lastUpdateAccountInput.Extra)
+	}
+}

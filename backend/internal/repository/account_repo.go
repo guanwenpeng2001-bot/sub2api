@@ -504,10 +504,32 @@ func (r *accountRepository) updateAccount(
 	}
 
 	account.UpdatedAt = updated.UpdatedAt
+	account.Extra = normalizeJSONMap(updated.Extra)
 	// 普通账号编辑（如 model_mapping / credentials）也需要立即刷新单账号快照，
 	// 否则网关在 outbox worker 延迟或异常时仍可能读到旧配置。
 	if contextTx == nil {
 		r.syncSchedulerAccountSnapshot(baseCtx, account.ID)
+	}
+	return nil
+}
+
+// replaceAccountEditableExtra runs under the account row lock in the update transaction.
+// Only catalog synchronization can replace the protected database keys.
+func replaceAccountEditableExtra(ctx context.Context, client *dbent.Client, id int64, extra map[string]any) error {
+	for _, key := range service.UpstreamModelSyncManagedExtraKeys() {
+		delete(extra, key)
+	}
+	payload, err := json.Marshal(extra)
+	if err != nil {
+		return err
+	}
+	_, err = client.ExecContext(ctx, `UPDATE accounts SET extra = $1::jsonb ||
+		(SELECT COALESCE(jsonb_object_agg(key, value), '{}'::jsonb)
+		 FROM jsonb_each(COALESCE(extra, '{}'::jsonb))
+		 WHERE key = ANY($2::text[])) WHERE id = $3 AND deleted_at IS NULL`,
+		string(payload), pq.Array(service.UpstreamModelSyncManagedExtraKeys()), id)
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -524,6 +546,9 @@ func (r *accountRepository) updateLockedAccount(
 	if err != nil {
 		return nil, err
 	}
+	if err := replaceAccountEditableExtra(ctx, client, account.ID, extra); err != nil {
+		return nil, err
+	}
 	account.Extra = extra
 
 	schedulable := account.Schedulable
@@ -537,7 +562,6 @@ func (r *accountRepository) updateLockedAccount(
 		SetPlatform(account.Platform).
 		SetType(account.Type).
 		SetCredentials(normalizeJSONMap(account.Credentials)).
-		SetExtra(extra).
 		SetConcurrency(account.Concurrency).
 		SetPriority(account.Priority).
 		SetStatus(account.Status).

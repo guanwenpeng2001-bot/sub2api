@@ -775,9 +775,10 @@ describe('EditAccountModal', () => {
     await wrapper.get('[data-testid="upstream-user-agent"]').setValue(value)
     await wrapper.get('form#edit-account-form').trigger('submit.prevent')
     expect(updateAccountMock).toHaveBeenCalledTimes(1)
-    const extra = updateAccountMock.mock.calls[0][1].extra
-    expect(extra).toMatchObject({ unrelated: { keep: true }, upstream_request_id_header: 'X-Request-ID' })
-    expect(extra.upstream_user_agent).toBe(value.trim() || undefined)
+    const payload = updateAccountMock.mock.calls[0][1]
+    expect(payload.upstream_user_agent).toBe(value.trim())
+    expect(payload.extra?.upstream_user_agent).toBe('old-agent')
+    expect(payload.extra?.unrelated).toEqual({ keep: true })
     expect(account.extra.upstream_user_agent).toBe('old-agent')
   })
 

@@ -11,6 +11,7 @@ import (
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	dbaccount "github.com/Wei-Shaw/sub2api/ent/account"
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 
 	"entgo.io/ent/dialect"
@@ -373,6 +374,7 @@ func TestUpdateWithAccountBillingSettingsRollsBackWhenOutboxFails(t *testing.T) 
 		WithArgs(int64(27), service.PlatformOpenAI, service.AccountTypeAPIKey, `{"api_key":"sk-test"}`, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"identity_unchanged", "ollama_group_unchanged", "ollama_proxy_unchanged", "enabled", "rate_sync_enabled", "snapshot", "ollama_session", "ollama_auto", "ollama_snapshot"}).
 			AddRow(true, false, true, []byte(`true`), []byte(`true`), []byte(`{"status":"ok"}`), nil, nil, nil))
+	mock.ExpectExec(`(?s)UPDATE accounts SET extra = .*jsonb_object_agg.*`).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`(?s)UPDATE .*accounts.*SET.*WHERE .*id.*`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(`(?s)SELECT .* FROM "accounts" WHERE "id" = \$1`).
@@ -480,4 +482,23 @@ func updatedAccountRows(id int64, extra string) *sqlmock.Rows {
 		service.StatusActive, nil, nil, nil, false, true, nil, nil, nil, nil, nil, nil,
 		nil, nil, nil, service.QuotaDimensionGlobal,
 	)
+}
+
+func TestReplaceAccountEditableExtraProtectsCatalogKeysInDatabase(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	client := dbent.NewClient(dbent.Driver(entsql.OpenDB(dialect.Postgres, db)))
+	defer client.Close()
+	extra := map[string]any{"upstream_user_agent": "new-agent"}
+	for _, key := range service.UpstreamModelSyncManagedExtraKeys() {
+		extra[key] = "stale"
+	}
+	// Protection reads current database values in the UPDATE itself; stale values
+	// must not be parameters, and absent database keys must not be resurrected.
+	mock.ExpectExec(`(?s)UPDATE accounts SET extra = \$1::jsonb \|\|.*jsonb_object_agg\(key, value\).*jsonb_each\(COALESCE\(extra,.*WHERE key = ANY\(\$2::text\[\]\)\).*id = \$3`).
+		WithArgs(`{"upstream_user_agent":"new-agent"}`, pq.Array(service.UpstreamModelSyncManagedExtraKeys()), int64(27)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	require.NoError(t, replaceAccountEditableExtra(context.Background(), client, 27, extra))
+	require.NoError(t, mock.ExpectationsWereMet())
 }

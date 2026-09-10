@@ -1605,3 +1605,15 @@ func dedupeAndSortModelIDs(models []string) []string {
 	sort.Strings(result)
 	return result
 }
+
+// UpstreamModelSyncManagedExtraKeys are exclusively written by catalog synchronization.
+func UpstreamModelSyncManagedExtraKeys() []string {
+	return []string{UpstreamModelMetadataExtraKey, UpstreamModelSyncStatusExtraKey,
+		UpstreamModelSyncAttemptExtraKey, UpstreamModelSyncSuccessExtraKey,
+		UpstreamModelSyncCountExtraKey, UpstreamModelSyncWarningsExtraKey}
+}
+func stripUpstreamModelSyncManagedExtra(extra map[string]any) {
+	for _, key := range UpstreamModelSyncManagedExtraKeys() {
+		delete(extra, key)
+	}
+}

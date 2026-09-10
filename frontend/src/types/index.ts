@@ -1485,6 +1485,7 @@ export interface CreateAccountRequest {
 }
 
 export interface UpdateAccountRequest {
+  upstream_user_agent?: string
   name?: string
   notes?: string | null
   type?: AccountType

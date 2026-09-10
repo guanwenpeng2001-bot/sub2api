@@ -84,7 +84,7 @@ func resolveUpstreamModelSyncConfig(values map[string]string, current upstreamMo
 		} else {
 			result.enabled = value
 		}
-	} else if raw, ok := os.LookupEnv("UPSTREAM_MODEL_SYNC_ENABLED"); ok {
+	} else if raw, ok := os.LookupEnv("UPSTREAM_MODEL_SYNC_ENABLED"); ok && strings.TrimSpace(raw) != "" {
 		value, err := strconv.ParseBool(strings.TrimSpace(raw))
 		if err != nil {
 			diagnostics = append(diagnostics, fmt.Errorf("UPSTREAM_MODEL_SYNC_ENABLED: %w", err))
@@ -104,6 +104,7 @@ func resolveUpstreamModelSyncConfig(values map[string]string, current upstreamMo
 		source := field.key
 		if !present {
 			raw, present = os.LookupEnv(field.env)
+			present = present && strings.TrimSpace(raw) != ""
 			source = field.env
 			if present {
 				count, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
@@ -177,10 +178,6 @@ func ProvideUpstreamModelSyncScheduler(
 			default:
 			}
 		})
-	}
-	if _, err := svc.reloadConfig(); err != nil {
-		slog.Error("load upstream model sync settings; scheduler disabled", "error", err)
-		svc.config.enabled = false
 	}
 	svc.Start()
 	return svc
@@ -260,29 +257,62 @@ func (s *UpstreamModelSyncScheduler) runLoop() {
 			ticks = timer.C
 		}
 	}
+	// Retry configuration independently of the possibly disabled cycle timer.
+	retry := time.NewTimer(time.Hour)
+	defer retry.Stop()
+	var retries <-chan time.Time
+	backoff := time.Second
+	reload := func() bool {
+		if !retry.Stop() {
+			select {
+			case <-retry.C:
+			default:
+			}
+		}
+		retries = nil
+		_, err := s.reloadConfig()
+		if err != nil {
+			slog.Error("reload upstream model sync settings; retrying", "error", err)
+			retry.Reset(backoff)
+			retries = retry.C
+			backoff = min(backoff*2, time.Minute)
+			return false
+		}
+		backoff = time.Second
+		return true
+	}
 	reset()
+	if !reload() {
+		ticks = nil
+	} else {
+		reset()
+	}
 	for {
 		select {
 		case <-s.parentCtx.Done():
 			return
 		case <-s.wake:
-			changed, err := s.reloadConfig()
-			if err != nil {
-				slog.Error("reload upstream model sync settings; keeping current configuration", "error", err)
-			} else if changed {
+			if reload() {
+				reset()
+			}
+		case <-retries:
+			if reload() {
 				reset()
 			}
 		case <-ticks:
-			// Read pending updates before beginning another cycle, including disable.
-			changed, err := s.reloadConfig()
-			if err != nil {
-				slog.Error("reload upstream model sync settings; deferring cycle", "error", err)
-			} else if !changed {
-				if err := s.RunOnce(s.parentCtx); err != nil {
-					logger.LegacyPrintf("service.upstream_model_sync", "run_once_failed: err=%v", err)
+			if reload() {
+				s.mu.Lock()
+				enabled := s.config.enabled
+				s.mu.Unlock()
+				if enabled {
+					if err := s.RunOnce(s.parentCtx); err != nil {
+						logger.LegacyPrintf("service.upstream_model_sync", "run_once_failed: err=%v", err)
+					}
 				}
+				reset()
+			} else {
+				ticks = nil
 			}
-			reset()
 		}
 	}
 }

@@ -749,3 +749,29 @@ func TestBulkUpdateAccountsKeepsProbeSnapshotForUnrelatedCredentials(t *testing.
 	require.Len(t, repo.bulkUpdates, 1)
 	require.NotContains(t, repo.bulkUpdates[0].Extra, UpstreamBillingProbeExtraKey)
 }
+
+func TestBulkUpdateAccountsDropsCatalogManagedFields(t *testing.T) {
+	repo := &upstreamBillingProbeAccountRepo{}
+	extra := map[string]any{"custom": "keep"}
+	for _, key := range UpstreamModelSyncManagedExtraKeys() {
+		extra[key] = "stale"
+	}
+	_, err := (&adminServiceImpl{accountRepo: repo}).BulkUpdateAccounts(context.Background(), &BulkUpdateAccountsInput{AccountIDs: []int64{1}, Extra: extra})
+	require.NoError(t, err)
+	require.Len(t, repo.bulkUpdates, 1)
+	require.Equal(t, map[string]any{"custom": "keep"}, repo.bulkUpdates[0].Extra)
+}
+
+func TestUpdateAccountDedicatedUserAgent(t *testing.T) {
+	for _, ua := range []string{"new-agent", ""} {
+		repo := &upstreamBillingProbeAdminRepo{&upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{1: {ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Extra: map[string]any{"custom": "keep"}}}}}
+		updated, err := (&adminServiceImpl{accountRepo: repo}).UpdateAccount(context.Background(), 1, &UpdateAccountInput{UpstreamUserAgent: &ua})
+		require.NoError(t, err)
+		require.Equal(t, ua, updated.Extra[UpstreamUserAgentExtraKey])
+		require.Equal(t, "keep", updated.Extra["custom"])
+	}
+	for _, ua := range []string{"bad\tua", "bad\nua", "bad\x7fua"} {
+		_, err := (&adminServiceImpl{}).UpdateAccount(context.Background(), 1, &UpdateAccountInput{UpstreamUserAgent: &ua})
+		require.Error(t, err)
+	}
+}

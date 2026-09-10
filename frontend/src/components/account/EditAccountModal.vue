@@ -2978,7 +2978,7 @@
 </template>
 
 <script setup lang="ts">
-import { validateUpstreamUserAgent, withUpstreamUserAgent } from './upstreamUserAgent'
+import { validateUpstreamUserAgent } from './upstreamUserAgent'
 import { ref, reactive, computed, watch, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
@@ -5590,10 +5590,7 @@ const handleSubmit = async () => {
     }
 
     if (upstreamUserAgent.value.trim() !== (props.account.extra?.upstream_user_agent ?? '')) {
-      updatePayload.extra = withUpstreamUserAgent(
-        (updatePayload.extra as Record<string, unknown> | undefined) || props.account.extra,
-        upstreamUserAgent.value
-      )
+      updatePayload.upstream_user_agent = upstreamUserAgent.value.trim()
     }
 
     // 上游ID头名只在改动时写回 extra，避免用弹窗打开时的快照覆盖运行态键。

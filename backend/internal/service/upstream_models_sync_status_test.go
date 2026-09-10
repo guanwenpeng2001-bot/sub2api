@@ -196,3 +196,19 @@ func TestUpstreamModelSyncCancellationDuringEnrichmentDiscardsPendingSnapshot(t 
 func (u *upstreamSyncCancelOnRegistry) DoWithTLS(req *http.Request, proxy string, id int64, concurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
 	return u.Do(req, proxy, id, concurrency)
 }
+
+func TestAdminExtraPatchCannotOverwriteCatalogState(t *testing.T) {
+	extra := map[string]any{"unrelated": "keep"}
+	patch := map[string]any{UpstreamUserAgentExtraKey: "new-agent"}
+	for _, key := range UpstreamModelSyncManagedExtraKeys() {
+		extra[key] = "fresh"
+		patch[key] = "stale"
+	}
+	repo := &upstreamSyncStateRepo{extra: extra}
+	require.NoError(t, (&adminServiceImpl{accountRepo: repo}).UpdateAccountExtra(context.Background(), 1, patch))
+	for _, key := range UpstreamModelSyncManagedExtraKeys() {
+		require.Equal(t, "fresh", extra[key])
+	}
+	require.Equal(t, "new-agent", extra[UpstreamUserAgentExtraKey])
+	require.Equal(t, "keep", extra["unrelated"])
+}

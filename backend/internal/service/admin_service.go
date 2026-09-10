@@ -426,6 +426,7 @@ type ShadowOptions struct {
 }
 
 type UpdateAccountInput struct {
+	UpstreamUserAgent     *string
 	Name                  string
 	Notes                 *string
 	Type                  string // Account type: oauth, setup-token, apikey

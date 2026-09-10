@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -191,4 +192,52 @@ func TestUpstreamModelSyncScheduler_StopCancelsAndWaitsForRunOnce(t *testing.T) 
 	require.ErrorIs(t, s.RunOnce(context.Background()), context.Canceled)
 	s.Start()
 	require.False(t, s.started, "a stopped scheduler must not restart")
+}
+
+func TestUpstreamModelSyncEmptyEnvironment(t *testing.T) {
+	for _, raw := range []string{"", "  "} {
+		for _, key := range []string{"UPSTREAM_MODEL_SYNC_ENABLED", "UPSTREAM_MODEL_SYNC_INTERVAL_HOURS", "UPSTREAM_MODEL_SYNC_ACCOUNT_TIMEOUT_SECONDS"} {
+			t.Setenv(key, raw)
+		}
+		got, err := resolveUpstreamModelSyncConfig(nil, defaultUpstreamModelSyncConfig())
+		require.NoError(t, err)
+		require.Equal(t, defaultUpstreamModelSyncConfig(), got)
+	}
+}
+
+type recoveringSyncSettings struct {
+	SettingRepository
+	calls    atomic.Int32
+	disabled bool
+}
+
+func (r *recoveringSyncSettings) GetAll(context.Context) (map[string]string, error) {
+	if r.calls.Add(1) <= 2 {
+		return nil, errors.New("temporary settings failure")
+	}
+	enabled := "true"
+	if r.disabled {
+		enabled = "false"
+	}
+	return map[string]string{SettingKeyUpstreamModelSyncEnabled: enabled, SettingKeyUpstreamModelSyncInterval: "10ms"}, nil
+}
+func TestUpstreamModelSyncSchedulerRecoversWithoutNotification(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "enabled", true: "disabled"}[disabled], func(t *testing.T) {
+			repo := &recoveringSyncSettings{disabled: disabled}
+			s := newUpstreamModelSyncScheduler(&upstreamModelSyncListerStub{accounts: []Account{{ID: 1}}}, nil, defaultUpstreamModelSyncConfig())
+			s.settings = &SettingService{settingRepo: repo}
+			var synced atomic.Int32
+			s.syncAccount = func(context.Context, *Account) error { synced.Add(1); return nil }
+			s.Start()
+			defer s.Stop()
+			require.Eventually(t, func() bool { return repo.calls.Load() >= 3 }, 5*time.Second, 10*time.Millisecond)
+			if disabled {
+				time.Sleep(30 * time.Millisecond)
+				require.Zero(t, synced.Load())
+			} else {
+				require.Eventually(t, func() bool { return synced.Load() > 0 }, time.Second, 10*time.Millisecond)
+			}
+		})
+	}
 }
