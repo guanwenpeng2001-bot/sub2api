@@ -798,6 +798,50 @@ func (s *SettingService) SetOpenAIImagesOAuthUnavailableCooldownSettings(ctx con
 	return s.settingRepo.Set(ctx, SettingKeyOpenAIImagesOAuthUnavailableCooldownSettings, string(data))
 }
 
+func (s *SettingService) GetReactiveCooldownSettings(ctx context.Context) (*ReactiveCooldownSettings, error) {
+	value, err := s.settingRepo.GetValue(ctx, SettingKeyReactiveCooldownSettings)
+	if err != nil {
+		if errors.Is(err, ErrSettingNotFound) {
+			return DefaultReactiveCooldownSettings(), nil
+		}
+		return nil, fmt.Errorf("get reactive cooldown settings: %w", err)
+	}
+	if value == "" {
+		return DefaultReactiveCooldownSettings(), nil
+	}
+	var settings ReactiveCooldownSettings
+	if err := json.Unmarshal([]byte(value), &settings); err != nil {
+		return DefaultReactiveCooldownSettings(), nil
+	}
+	return settings.normalized(), nil
+}
+
+func (s *SettingService) SetReactiveCooldownSettings(ctx context.Context, settings *ReactiveCooldownSettings) error {
+	if settings == nil {
+		return fmt.Errorf("settings cannot be nil")
+	}
+	if settings.PlanGatedMinutes < 1 || settings.PlanGatedMinutes > maxReactiveCooldownMinutes {
+		return fmt.Errorf("plan_gated_minutes must be between 1-%d", maxReactiveCooldownMinutes)
+	}
+	if settings.ModelNotFoundMinutes < 1 || settings.ModelNotFoundMinutes > maxReactiveCooldownMinutes {
+		return fmt.Errorf("model_not_found_minutes must be between 1-%d", maxReactiveCooldownMinutes)
+	}
+	if settings.OpenAI403Minutes < 1 || settings.OpenAI403Minutes > maxReactiveCooldownMinutes {
+		return fmt.Errorf("openai_403_minutes must be between 1-%d", maxReactiveCooldownMinutes)
+	}
+	if settings.KimiConcurrencyLimitSeconds < 1 || settings.KimiConcurrencyLimitSeconds > maxKimiConcurrencyLimitSeconds {
+		return fmt.Errorf("kimi_concurrency_limit_seconds must be between 1-%d", maxKimiConcurrencyLimitSeconds)
+	}
+	if settings.ImageCapabilityLossMinutes < 1 || settings.ImageCapabilityLossMinutes > maxReactiveCooldownMinutes {
+		return fmt.Errorf("image_capability_loss_minutes must be between 1-%d", maxReactiveCooldownMinutes)
+	}
+	data, err := json.Marshal(settings)
+	if err != nil {
+		return fmt.Errorf("marshal reactive cooldown settings: %w", err)
+	}
+	return s.settingRepo.Set(ctx, SettingKeyReactiveCooldownSettings, string(data))
+}
+
 // GetStreamTimeoutSettings 获取流超时处理配置
 func (s *SettingService) GetStreamTimeoutSettings(ctx context.Context) (*StreamTimeoutSettings, error) {
 	value, err := s.settingRepo.GetValue(ctx, SettingKeyStreamTimeoutSettings)

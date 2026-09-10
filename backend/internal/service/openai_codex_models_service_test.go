@@ -276,6 +276,12 @@ func TestNewConfiguredCodexModelDescriptorUsesProviderMetadataAndSafeFallback(t 
 	}, deepSeek.SupportedReasoningLevels)
 	require.True(t, deepSeek.SupportsParallelToolCalls)
 	require.Equal(t, []string{"text"}, deepSeek.InputModalities)
+	require.Equal(t, "DeepSeek coding and reasoning model.", deepSeek.Description)
+
+	deepSeekVision := newConfiguredCodexModelDescriptor("deepseek-v4-flash-vision-exp")
+	require.Equal(t, []string{"text", "image"}, deepSeekVision.InputModalities)
+	require.True(t, accountCodexModelSupportsImageInput(&Account{Platform: PlatformDeepseek}, "deepseek-v4-flash-vision-exp"))
+	require.False(t, accountCodexModelSupportsImageInput(&Account{Platform: PlatformDeepseek}, "deepseek-v4-pro"))
 
 	grok := newConfiguredCodexModelDescriptor("grok-4.6")
 	require.Equal(t, "Grok 4.6", grok.DisplayName)
@@ -330,7 +336,7 @@ func TestNewConfiguredCodexModelDescriptorUsesProviderMetadataAndSafeFallback(t 
 
 	gpt56 := newConfiguredCodexModelDescriptor("gpt-5.6-sol")
 	require.Equal(t, "GPT-5.6 Sol", gpt56.DisplayName)
-	require.Equal(t, "OpenAI GPT coding model routed through Sub2API.", gpt56.Description)
+	require.Equal(t, "OpenAI GPT coding model.", gpt56.Description)
 	require.NotNil(t, gpt56.DefaultReasoningLevel)
 	require.Equal(t, "low", *gpt56.DefaultReasoningLevel)
 	require.Equal(t, configuredCodexGPTReasoningLevels("gpt-5.6-sol"), gpt56.SupportedReasoningLevels)
@@ -936,7 +942,7 @@ func TestBuildCodexModelsManifestForGroupUsesMappedTargetMetadataForCompositeAli
 	require.Len(t, models, 1)
 	require.Equal(t, "reasoning-alias", models[0]["slug"])
 	require.Equal(t, "reasoning-alias", models[0]["display_name"])
-	require.Equal(t, "Custom model routed through Sub2API.", models[0]["description"])
+	require.Equal(t, "Custom coding and reasoning model.", models[0]["description"])
 	require.Equal(t, []string{"low", "medium", "high", "xhigh", "max"}, effortsFromManifestModel(t, models[0]))
 }
 
@@ -978,7 +984,7 @@ func TestBuildCodexModelsManifestForGroupUsesSafeFallbackForConflictingAliasTarg
 	require.Len(t, models, 1)
 	require.Equal(t, "shared-alias", models[0]["slug"])
 	require.Equal(t, "shared-alias", models[0]["display_name"])
-	require.Equal(t, "Custom model routed through Sub2API.", models[0]["description"])
+	require.Equal(t, "Custom coding and reasoning model.", models[0]["description"])
 	require.Empty(t, effortsFromManifestModel(t, models[0]))
 }
 

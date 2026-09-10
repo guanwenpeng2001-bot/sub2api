@@ -332,7 +332,7 @@ func openAIConfiguredCodexModelIDsForGroup(accounts []Account, group *Group) []s
 
 const (
 	configuredCodexModelPriority       = 50
-	configuredCodexCustomDescription   = "Custom model routed through Sub2API."
+	configuredCodexCustomDescription   = "Custom coding and reasoning model."
 	configuredCodexFallbackContext     = 272_000
 	configuredCodexDeepSeekV4Context   = 1_000_000
 	configuredCodexGrokContext         = 500_000
@@ -454,11 +454,14 @@ func newConfiguredCodexModelDescriptor(modelID string) configuredCodexModelDescr
 		ExperimentalSupportedTools:        []string{},
 		InputModalities:                   []string{"text"},
 	}
+	if codexModelSupportsVisionInput(modelID) {
+		descriptor.InputModalities = []string{"text", "image"}
+	}
 
 	if isDeepSeekCodexModel(modelID) {
 		defaultReasoningLevel := "high"
 		descriptor.DisplayName = deepSeekCodexDisplayName(modelID)
-		descriptor.Description = "DeepSeek coding and reasoning model routed through Sub2API."
+		descriptor.Description = "DeepSeek coding and reasoning model."
 		descriptor.DefaultReasoningLevel = &defaultReasoningLevel
 		descriptor.SupportedReasoningLevels = []configuredCodexReasoningLevel{
 			{Effort: "low", Description: "Fast responses with lighter reasoning"},
@@ -472,7 +475,7 @@ func newConfiguredCodexModelDescriptor(modelID string) configuredCodexModelDescr
 
 	if isGrokCodexModel(modelID) {
 		descriptor.DisplayName = grokCodexDisplayName(modelID)
-		descriptor.Description = "Grok coding and reasoning model routed through Sub2API."
+		descriptor.Description = "Grok coding and reasoning model."
 		descriptor.SupportsParallelToolCalls = true
 		descriptor.ContextWindow = grokCodexContextWindow(modelID)
 		descriptor.MaxContextWindow = descriptor.ContextWindow
@@ -485,7 +488,7 @@ func newConfiguredCodexModelDescriptor(modelID string) configuredCodexModelDescr
 
 	if isClaudeCodexModel(modelID) {
 		descriptor.DisplayName = claudeCodexDisplayName(modelID)
-		descriptor.Description = "Claude coding and reasoning model routed through Sub2API."
+		descriptor.Description = "Claude coding and reasoning model."
 		descriptor.SupportsParallelToolCalls = true
 		if levels := configuredCodexClaudeReasoningLevels(modelID); len(levels) > 0 {
 			defaultReasoningLevel := claudeCodexDefaultReasoningLevel(levels)
@@ -496,7 +499,7 @@ func newConfiguredCodexModelDescriptor(modelID string) configuredCodexModelDescr
 
 	if isOpenAICodexGPTModel(modelID) {
 		descriptor.DisplayName = openaiCodexDisplayName(modelID)
-		descriptor.Description = "OpenAI GPT coding model routed through Sub2API."
+		descriptor.Description = "OpenAI GPT coding model."
 		descriptor.SupportsParallelToolCalls = true
 		descriptor.ServiceTiers = configuredCodexServiceTiersForModel(modelID)
 		if isOpenAICodexReasoningGPTModel(modelID) {
@@ -1075,7 +1078,7 @@ func groupCodexModelSupportsImageInput(
 		}
 	}
 	if platform != PlatformOpenAI && platform != PlatformGrok {
-		return false
+		return codexModelSupportsVisionInput(upstreamModel)
 	}
 
 	candidates := 0
@@ -1245,8 +1248,19 @@ func accountCodexModelSupportsImageInput(account *Account, upstreamModel string)
 		canonical := xai.ResolveGrokTextResponsesModelID(upstreamModel)
 		return isGrokCodexImageInputModel(canonical)
 	default:
+		return codexModelSupportsVisionInput(upstreamModel)
+	}
+}
+
+func codexModelSupportsVisionInput(modelID string) bool {
+	slug := strings.ToLower(strings.TrimSpace(modelID))
+	if slug == "" {
 		return false
 	}
+	if strings.Contains(slug, "vision") {
+		return true
+	}
+	return identifiedModelPricingSupportsVision(modelID)
 }
 
 func isOfficialOpenAICodexAccount(account *Account) bool {

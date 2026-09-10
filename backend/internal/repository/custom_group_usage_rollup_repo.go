@@ -111,38 +111,66 @@ func (r *usageLogRepository) getAllGroupUsageSummaryFromRollups(ctx context.Cont
 	return results, nil
 }
 
+const groupUsageRollupSyncMaxAttempts = 3
+
+type groupUsageRollupRebuildPlan struct {
+	todayDate        string
+	retainedDate     string
+	rebuildStartDate string
+	timezoneName     string
+	timezoneChanged  bool
+	rebuildStart     time.Time
+	todayStart       time.Time
+	retainedFrom     time.Time
+}
+
 // SyncGroupUsageRollups 将服务端配置时区今日以前的用量发布为分组日桶。
+// 历史聚合不持有 usage_group_rollup_state 行锁，避免与 usage_logs INSERT 触发器互堵。
 func (r *dashboardAggregationRepository) SyncGroupUsageRollups(ctx context.Context, todayStart time.Time) error {
 	if r == nil || r.sql == nil {
 		return nil
 	}
 	todayStart = service.GroupUsageTodayStart(todayStart)
-	if db, ok := r.sql.(*sql.DB); ok {
-		tx, err := db.BeginTx(ctx, nil)
+	for attempt := 0; attempt < groupUsageRollupSyncMaxAttempts; attempt++ {
+		retry, err := r.syncGroupUsageRollupsAttempt(ctx, todayStart)
 		if err != nil {
 			return err
 		}
-		txRepo := newDashboardAggregationRepositoryWithSQL(tx)
-		if err := txRepo.syncGroupUsageRollupsInTx(ctx, todayStart); err != nil {
-			_ = tx.Rollback()
-			return err
+		if !retry {
+			return nil
 		}
-		return tx.Commit()
 	}
-	return r.syncGroupUsageRollupsInTx(ctx, todayStart)
+	return fmt.Errorf("分组用量汇总水位在重建期间被并发回退")
 }
 
-func (r *dashboardAggregationRepository) syncGroupUsageRollupsInTx(ctx context.Context, todayStart time.Time) error {
+func (r *dashboardAggregationRepository) syncGroupUsageRollupsAttempt(ctx context.Context, todayStart time.Time) (bool, error) {
+	plan, err := r.planGroupUsageRollupRebuild(ctx, todayStart, false)
+	if err != nil {
+		return false, err
+	}
+	if plan == nil {
+		return false, nil
+	}
+	if err := r.rebuildGroupUsageDailyRollups(ctx, plan); err != nil {
+		return false, err
+	}
+	return r.publishGroupUsageRollupWatermark(ctx, todayStart, plan)
+}
+
+func (r *dashboardAggregationRepository) planGroupUsageRollupRebuild(ctx context.Context, todayStart time.Time, forUpdate bool) (*groupUsageRollupRebuildPlan, error) {
 	var closedBefore string
 	var previousRetainedFrom time.Time
 	var stateTimezoneName string
-	if err := scanSingleRow(ctx, r.sql, `
+	query := `
 		SELECT closed_before::text, retained_from, timezone_name
 		FROM usage_group_rollup_state
-		WHERE id = 1
-		FOR UPDATE
-	`, nil, &closedBefore, &previousRetainedFrom, &stateTimezoneName); err != nil {
-		return fmt.Errorf("读取分组用量汇总水位: %w", err)
+		WHERE id = 1`
+	if forUpdate {
+		query += `
+		FOR UPDATE`
+	}
+	if err := scanSingleRow(ctx, r.sql, query, nil, &closedBefore, &previousRetainedFrom, &stateTimezoneName); err != nil {
+		return nil, fmt.Errorf("读取分组用量汇总水位: %w", err)
 	}
 
 	todayDate := service.GroupUsageDate(todayStart)
@@ -153,23 +181,23 @@ func (r *dashboardAggregationRepository) syncGroupUsageRollupsInTx(ctx context.C
 		var err error
 		closedTime, err = service.ParseGroupUsageDate(closedBefore)
 		if err != nil {
-			return fmt.Errorf("解析分组用量汇总水位 %q: %w", closedBefore, err)
+			return nil, fmt.Errorf("解析分组用量汇总水位 %q: %w", closedBefore, err)
 		}
 		todayDateTime, err := service.ParseGroupUsageDate(todayDate)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if closedTime.After(todayDateTime) {
-			return fmt.Errorf("分组用量汇总水位位于未来: %s", closedBefore)
+			return nil, fmt.Errorf("分组用量汇总水位位于未来: %s", closedBefore)
 		}
 		if closedBefore == todayDate {
-			return nil
+			return nil, nil
 		}
 	}
 
 	var earliest sql.NullTime
 	if err := scanSingleRow(ctx, r.sql, "SELECT MIN(created_at) FROM usage_logs", nil, &earliest); err != nil {
-		return fmt.Errorf("读取最早用量记录: %w", err)
+		return nil, fmt.Errorf("读取最早用量记录: %w", err)
 	}
 	retainedFrom := todayStart
 	if earliest.Valid {
@@ -178,7 +206,7 @@ func (r *dashboardAggregationRepository) syncGroupUsageRollupsInTx(ctx context.C
 	retainedDate := service.GroupUsageDate(retainedFrom)
 	retainedDateTime, err := service.ParseGroupUsageDate(retainedDate)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	rebuildStartDate := retainedDate
 	if !timezoneChanged && closedTime.After(retainedDateTime) {
@@ -186,15 +214,29 @@ func (r *dashboardAggregationRepository) syncGroupUsageRollupsInTx(ctx context.C
 	}
 	rebuildStart, err := service.ParseGroupUsageDate(rebuildStartDate)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	return &groupUsageRollupRebuildPlan{
+		todayDate:        todayDate,
+		retainedDate:     retainedDate,
+		rebuildStartDate: rebuildStartDate,
+		timezoneName:     timezoneName,
+		timezoneChanged:  timezoneChanged,
+		rebuildStart:     rebuildStart,
+		todayStart:       todayStart,
+		retainedFrom:     retainedFrom,
+	}, nil
+}
 
-	if _, err := r.sql.ExecContext(ctx, `
+func (r *dashboardAggregationRepository) rebuildGroupUsageDailyRollups(ctx context.Context, plan *groupUsageRollupRebuildPlan) error {
+	if plan.timezoneChanged {
+		if _, err := r.sql.ExecContext(ctx, `DELETE FROM usage_group_daily_rollups`); err != nil {
+			return fmt.Errorf("清理分组用量日桶: %w", err)
+		}
+	} else if _, err := r.sql.ExecContext(ctx, `
 		DELETE FROM usage_group_daily_rollups
-		WHERE bucket_date < $1::date
-			OR (bucket_date >= $2::date AND bucket_date < $3::date)
-			OR bucket_date >= $3::date
-	`, retainedDate, rebuildStartDate, todayDate); err != nil {
+		WHERE bucket_date >= $1::date
+	`, plan.rebuildStartDate); err != nil {
 		return fmt.Errorf("清理分组用量日桶: %w", err)
 	}
 
@@ -214,10 +256,60 @@ func (r *dashboardAggregationRepository) syncGroupUsageRollupsInTx(ctx context.C
 		DO UPDATE SET
 			actual_cost = EXCLUDED.actual_cost,
 			computed_at = EXCLUDED.computed_at
-	`, rebuildStart.UTC(), todayStart.UTC(), timezoneName); err != nil {
+	`, plan.rebuildStart.UTC(), plan.todayStart.UTC(), plan.timezoneName); err != nil {
 		return fmt.Errorf("重建分组用量日桶: %w", err)
 	}
+	return nil
+}
 
+func (r *dashboardAggregationRepository) publishGroupUsageRollupWatermark(ctx context.Context, todayStart time.Time, plan *groupUsageRollupRebuildPlan) (bool, error) {
+	if db, ok := r.sql.(*sql.DB); ok {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return false, err
+		}
+		txRepo := newDashboardAggregationRepositoryWithSQL(tx)
+		retry, err := txRepo.publishGroupUsageRollupWatermarkInTx(ctx, todayStart, plan)
+		if err != nil {
+			_ = tx.Rollback()
+			return false, err
+		}
+		if retry {
+			_ = tx.Rollback()
+			return true, nil
+		}
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		if err := r.deleteStaleGroupUsageDailyRollups(ctx, plan); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	retry, err := r.publishGroupUsageRollupWatermarkInTx(ctx, todayStart, plan)
+	if err != nil {
+		return false, err
+	}
+	if retry {
+		return true, nil
+	}
+	if err := r.deleteStaleGroupUsageDailyRollups(ctx, plan); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func (r *dashboardAggregationRepository) publishGroupUsageRollupWatermarkInTx(ctx context.Context, todayStart time.Time, plan *groupUsageRollupRebuildPlan) (bool, error) {
+	current, err := r.planGroupUsageRollupRebuild(ctx, todayStart, true)
+	if err != nil {
+		return false, err
+	}
+	if current == nil {
+		return false, nil
+	}
+	if !plan.timezoneChanged && current.rebuildStart.Before(plan.rebuildStart) {
+		return true, nil
+	}
 	if _, err := r.sql.ExecContext(ctx, `
 		UPDATE usage_group_rollup_state
 		SET closed_before = $1::date,
@@ -225,8 +317,19 @@ func (r *dashboardAggregationRepository) syncGroupUsageRollupsInTx(ctx context.C
 			timezone_name = $3,
 			updated_at = NOW()
 		WHERE id = 1
-	`, todayDate, retainedFrom, timezoneName); err != nil {
-		return fmt.Errorf("更新分组用量汇总水位: %w", err)
+	`, plan.todayDate, plan.retainedFrom, plan.timezoneName); err != nil {
+		return false, fmt.Errorf("更新分组用量汇总水位: %w", err)
+	}
+	return false, nil
+}
+
+func (r *dashboardAggregationRepository) deleteStaleGroupUsageDailyRollups(ctx context.Context, plan *groupUsageRollupRebuildPlan) error {
+	if _, err := r.sql.ExecContext(ctx, `
+		DELETE FROM usage_group_daily_rollups
+		WHERE bucket_date < $1::date
+			OR bucket_date >= $2::date
+	`, plan.retainedDate, plan.todayDate); err != nil {
+		return fmt.Errorf("清理过期分组用量日桶: %w", err)
 	}
 	return nil
 }

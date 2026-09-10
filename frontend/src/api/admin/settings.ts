@@ -1322,6 +1322,31 @@ export async function updateRateLimit429CooldownSettings(
   return data;
 }
 
+export interface ReactiveCooldownSettings {
+  plan_gated_minutes: number;
+  model_not_found_minutes: number;
+  openai_403_minutes: number;
+  kimi_concurrency_limit_seconds: number;
+  image_capability_loss_minutes: number;
+}
+
+export async function getReactiveCooldownSettings(): Promise<ReactiveCooldownSettings> {
+  const { data } = await apiClient.get<ReactiveCooldownSettings>(
+    "/admin/settings/reactive-cooldown",
+  );
+  return data;
+}
+
+export async function updateReactiveCooldownSettings(
+  settings: ReactiveCooldownSettings,
+): Promise<ReactiveCooldownSettings> {
+  const { data } = await apiClient.put<ReactiveCooldownSettings>(
+    "/admin/settings/reactive-cooldown",
+    settings,
+  );
+  return data;
+}
+
 // ==================== Panel Rate Limit Settings ====================
 
 /**
@@ -1581,6 +1606,8 @@ export const settingsAPI = {
   updateOverloadCooldownSettings,
   getRateLimit429CooldownSettings,
   updateRateLimit429CooldownSettings,
+  getReactiveCooldownSettings,
+  updateReactiveCooldownSettings,
   getPanelRateLimitSettings,
   updatePanelRateLimitSettings,
   getStreamTimeoutSettings,

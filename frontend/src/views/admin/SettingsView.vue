@@ -434,6 +434,111 @@
             </div>
           </div>
 
+          <!-- Reactive cooldown settings -->
+          <div class="card">
+            <div
+              class="border-b border-gray-100 px-6 py-4 dark:border-dark-700"
+            >
+              <h2 class="text-lg font-semibold text-gray-900 dark:text-white">
+                {{ t("admin.settings.reactiveCooldown.title") }}
+              </h2>
+              <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
+                {{ t("admin.settings.reactiveCooldown.description") }}
+              </p>
+            </div>
+            <div class="space-y-5 p-6">
+              <div
+                v-if="reactiveCooldownLoading"
+                class="flex items-center gap-2 text-gray-500"
+              >
+                <div
+                  class="h-4 w-4 animate-spin rounded-full border-b-2 border-primary-600"
+                ></div>
+                {{ t("common.loading") }}
+              </div>
+              <template v-else>
+                <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <div>
+                    <label class="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300">
+                      {{ t("admin.settings.reactiveCooldown.planGatedMinutes") }}
+                    </label>
+                    <input
+                      v-model.number="reactiveCooldownForm.plan_gated_minutes"
+                      type="number"
+                      min="1"
+                      max="1440"
+                      class="input w-32"
+                    />
+                  </div>
+                  <div>
+                    <label class="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300">
+                      {{ t("admin.settings.reactiveCooldown.modelNotFoundMinutes") }}
+                    </label>
+                    <input
+                      v-model.number="reactiveCooldownForm.model_not_found_minutes"
+                      type="number"
+                      min="1"
+                      max="1440"
+                      class="input w-32"
+                    />
+                  </div>
+                  <div>
+                    <label class="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300">
+                      {{ t("admin.settings.reactiveCooldown.openai403Minutes") }}
+                    </label>
+                    <input
+                      v-model.number="reactiveCooldownForm.openai_403_minutes"
+                      type="number"
+                      min="1"
+                      max="1440"
+                      class="input w-32"
+                    />
+                  </div>
+                  <div>
+                    <label class="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300">
+                      {{ t("admin.settings.reactiveCooldown.kimiConcurrencySeconds") }}
+                    </label>
+                    <input
+                      v-model.number="reactiveCooldownForm.kimi_concurrency_limit_seconds"
+                      type="number"
+                      min="1"
+                      max="600"
+                      class="input w-32"
+                    />
+                  </div>
+                  <div>
+                    <label class="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300">
+                      {{ t("admin.settings.reactiveCooldown.imageCapabilityLossMinutes") }}
+                    </label>
+                    <input
+                      v-model.number="reactiveCooldownForm.image_capability_loss_minutes"
+                      type="number"
+                      min="1"
+                      max="1440"
+                      class="input w-32"
+                    />
+                  </div>
+                </div>
+                <div
+                  class="flex justify-end border-t border-gray-100 pt-4 dark:border-dark-700"
+                >
+                  <button
+                    type="button"
+                    @click="saveReactiveCooldownSettings"
+                    :disabled="reactiveCooldownSaving"
+                    class="btn btn-primary btn-sm"
+                  >
+                    {{
+                      reactiveCooldownSaving
+                        ? t("common.saving")
+                        : t("common.save")
+                    }}
+                  </button>
+                </div>
+              </template>
+            </div>
+          </div>
+
           <!-- Stream Timeout Settings -->
           <div class="card">
             <div
@@ -9025,6 +9130,16 @@ const rateLimit429CooldownForm = reactive({
   cooldown_seconds: 5,
 });
 
+const reactiveCooldownLoading = ref(true);
+const reactiveCooldownSaving = ref(false);
+const reactiveCooldownForm = reactive({
+  plan_gated_minutes: 30,
+  model_not_found_minutes: 30,
+  openai_403_minutes: 10,
+  kimi_concurrency_limit_seconds: 30,
+  image_capability_loss_minutes: 30,
+});
+
 // Panel API Rate Limit 状态
 const panelRateLimitLoading = ref(true);
 const panelRateLimitSaving = ref(false);
@@ -11938,6 +12053,38 @@ async function loadRateLimit429CooldownSettings() {
   }
 }
 
+async function loadReactiveCooldownSettings() {
+  reactiveCooldownLoading.value = true;
+  try {
+    const settings = await adminAPI.settings.getReactiveCooldownSettings();
+    Object.assign(reactiveCooldownForm, settings);
+  } catch (_error: unknown) {
+    // Silent fail - settings will use defaults
+  } finally {
+    reactiveCooldownLoading.value = false;
+  }
+}
+
+async function saveReactiveCooldownSettings() {
+  reactiveCooldownSaving.value = true;
+  try {
+    const updated = await adminAPI.settings.updateReactiveCooldownSettings({
+      ...reactiveCooldownForm,
+    });
+    Object.assign(reactiveCooldownForm, updated);
+    appStore.showSuccess(t("admin.settings.reactiveCooldown.saved"));
+  } catch (error: unknown) {
+    appStore.showError(
+      extractApiErrorMessage(
+        error,
+        t("admin.settings.reactiveCooldown.saveFailed"),
+      ),
+    );
+  } finally {
+    reactiveCooldownSaving.value = false;
+  }
+}
+
 async function saveRateLimit429CooldownSettings() {
   rateLimit429CooldownSaving.value = true;
   try {
@@ -12605,6 +12752,7 @@ onMounted(() => {
   loadOllamaCloudUsageSettings();
   loadOverloadCooldownSettings();
   loadRateLimit429CooldownSettings();
+  loadReactiveCooldownSettings();
   loadPanelRateLimitSettings();
   loadStreamTimeoutSettings();
   loadRectifierSettings();

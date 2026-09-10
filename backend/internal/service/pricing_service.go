@@ -133,6 +133,28 @@ var (
 	}
 )
 
+var (
+	identifiedPricingLookupMu sync.RWMutex
+	identifiedPricingLookup   func(string) *LiteLLMModelPricing
+)
+
+func registerIdentifiedPricingLookup(lookup func(string) *LiteLLMModelPricing) {
+	identifiedPricingLookupMu.Lock()
+	identifiedPricingLookup = lookup
+	identifiedPricingLookupMu.Unlock()
+}
+
+func identifiedModelPricingSupportsVision(modelID string) bool {
+	identifiedPricingLookupMu.RLock()
+	lookup := identifiedPricingLookup
+	identifiedPricingLookupMu.RUnlock()
+	if lookup == nil {
+		return false
+	}
+	pricing := lookup(modelID)
+	return pricing != nil && pricing.SupportsVision
+}
+
 // LiteLLMModelPricing LiteLLM价格数据结构
 // 只保留我们需要的字段，使用指针来处理可能缺失的值
 type LiteLLMModelPricing struct {
@@ -155,6 +177,7 @@ type LiteLLMModelPricing struct {
 	OutputCostPerImage                  float64 `json:"output_cost_per_image"`       // 图片生成模型每张图片价格
 	OutputCostPerImageToken             float64 `json:"output_cost_per_image_token"` // 图片输出 token 价格
 	InputCostPerImageToken              float64 `json:"input_cost_per_image_token"`  // 图片输入 token 价格（如 gpt-image-2 图片编辑）
+	SupportsVision                      bool    `json:"supports_vision"`
 
 	// TokenPricingAbsent 表示源数据中 input/output token 价格均缺失（仅有图片价）。
 	// 此类条目只可用于图片计费，token 计费必须回退到 fallback 或 fail-closed，
@@ -189,6 +212,7 @@ type LiteLLMRawEntry struct {
 	OutputCostPerImage                  *float64 `json:"output_cost_per_image"`
 	OutputCostPerImageToken             *float64 `json:"output_cost_per_image_token"`
 	InputCostPerImageToken              *float64 `json:"input_cost_per_image_token"`
+	SupportsVision                      bool     `json:"supports_vision"`
 }
 
 // PricingService 动态价格服务
@@ -499,6 +523,7 @@ func (s *PricingService) reloadCustomPricingLayers() error {
 	s.pricingData = data
 	s.customFilesHash = fingerprint
 	s.mu.Unlock()
+	registerIdentifiedPricingLookup(s.GetIdentifiedModelPricing)
 
 	logger.LegacyPrintf("service.pricing", "[Pricing] Custom pricing files changed, reloaded %d models from %s", len(data), pricingFile)
 	return nil
@@ -568,6 +593,7 @@ func (s *PricingService) downloadPricingData() error {
 	s.localHash = syncHash
 	s.customFilesHash = customFilesHash
 	s.mu.Unlock()
+	registerIdentifiedPricingLookup(s.GetIdentifiedModelPricing)
 
 	logger.LegacyPrintf("service.pricing", "[Pricing] Downloaded %d models successfully", len(data))
 	return nil
@@ -609,6 +635,7 @@ func (s *PricingService) parsePricingData(body []byte) (map[string]*LiteLLMModel
 			Mode:                  entry.Mode,
 			SupportsPromptCaching: entry.SupportsPromptCaching,
 			SupportsServiceTier:   entry.SupportsServiceTier,
+			SupportsVision:        entry.SupportsVision,
 			TokenPricingAbsent:    entry.InputCostPerToken == nil && entry.OutputCostPerToken == nil,
 		}
 
@@ -995,6 +1022,7 @@ func (s *PricingService) loadPricingData(filePath string) error {
 		s.lastUpdated = time.Now()
 	}
 	s.mu.Unlock()
+	registerIdentifiedPricingLookup(s.GetIdentifiedModelPricing)
 
 	logger.LegacyPrintf("service.pricing", "[Pricing] Loaded %d models from %s", len(pricingData), filePath)
 	return nil

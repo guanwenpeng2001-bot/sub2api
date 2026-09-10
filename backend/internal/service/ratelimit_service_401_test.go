@@ -23,6 +23,7 @@ type rateLimitAccountRepoStub struct {
 	lastExtraUpdates       map[string]any
 	lastErrorMsg           string
 	lastTempReason         string
+	lastTempUntil          time.Time
 	lastErrorID            int64
 	lastTempID             int64
 	tempErr                error
@@ -39,6 +40,7 @@ func (r *rateLimitAccountRepoStub) SetTempUnschedulable(ctx context.Context, id 
 	r.tempCalls++
 	r.lastTempID = id
 	r.lastTempReason = reason
+	r.lastTempUntil = until
 	return r.tempErr
 }
 

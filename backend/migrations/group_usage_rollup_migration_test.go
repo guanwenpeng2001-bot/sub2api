@@ -50,3 +50,14 @@ func TestMigration223TracksConfiguredTimezone(t *testing.T) {
 	require.Contains(t, sql, "CREATE OR REPLACE FUNCTION invalidate_group_usage_rollup_state")
 	require.Contains(t, sql, "CREATE OR REPLACE FUNCTION invalidate_group_usage_rollup_state_after_insert")
 }
+
+func TestMigration238ReplacesInsertTriggerLockWithCAS(t *testing.T) {
+	content, err := FS.ReadFile("238_group_usage_rollup_insert_cas.sql")
+	require.NoError(t, err)
+
+	sql := string(content)
+	require.Contains(t, sql, "CREATE OR REPLACE FUNCTION invalidate_group_usage_rollup_state_after_insert")
+	require.Contains(t, sql, "AND closed_before > affected_date")
+	require.NotContains(t, sql, "FOR KEY SHARE")
+	require.NotContains(t, sql, "FOR UPDATE")
+}

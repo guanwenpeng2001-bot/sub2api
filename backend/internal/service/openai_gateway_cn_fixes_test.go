@@ -144,22 +144,22 @@ func TestHandle403_CNProviderStructured403TempUnschedulableFirstHit(t *testing.T
 	require.Contains(t, repo.lastTempReason, "(1/3)")
 }
 
-func TestIsCNProviderConcurrencyLimit403_ExactClassification(t *testing.T) {
+func TestIsCNProviderConcurrencyLimit403_ContainsClassification(t *testing.T) {
 	kimi := &Account{Platform: PlatformKimi}
 
 	require.True(t, isCNProviderConcurrencyLimit403(kimi, kimiConcurrentRequestLimitMessage))
 	require.True(t, isCNProviderConcurrencyLimit403(kimi, "  "+kimiConcurrentRequestLimitMessage+"\n"))
+	require.True(t, isCNProviderConcurrencyLimit403(kimi, "You've reached your concurrent request limit. Please wait for your ongoing requests to finish and try again"))
+	require.True(t, isCNProviderConcurrencyLimit403(kimi, "concurrent request limit reached"))
 
 	for name, tc := range map[string]struct {
 		account *Account
 		message string
 	}{
-		"permission denied":              {kimi, "You do not have permission to access this resource."},
-		"generic concurrency wording":    {kimi, "concurrent request limit reached"},
-		"near match missing punctuation": {kimi, "You've reached your concurrent request limit. Please wait for your ongoing requests to finish and try again"},
-		"other CN provider":              {&Account{Platform: PlatformZhipu}, kimiConcurrentRequestLimitMessage},
-		"non CN provider":                {&Account{Platform: PlatformOpenAI}, kimiConcurrentRequestLimitMessage},
-		"nil account":                    {nil, kimiConcurrentRequestLimitMessage},
+		"permission denied": {kimi, "You do not have permission to access this resource."},
+		"other CN provider": {&Account{Platform: PlatformZhipu}, kimiConcurrentRequestLimitMessage},
+		"non CN provider":   {&Account{Platform: PlatformOpenAI}, kimiConcurrentRequestLimitMessage},
+		"nil account":       {nil, kimiConcurrentRequestLimitMessage},
 	} {
 		t.Run(name, func(t *testing.T) {
 			require.False(t, isCNProviderConcurrencyLimit403(tc.account, tc.message))
@@ -210,6 +210,8 @@ func TestHandle403_CNProviderConcurrencyLimitAlwaysUsesTemporaryCooldown(t *test
 	require.Len(t, blocker.accounts, 1)
 	require.Equal(t, cnConcurrencyLimitReasonPrefix, blocker.reasons[0])
 	require.True(t, blocker.until[0].After(time.Now()))
+	require.WithinDuration(t, time.Now().Add(time.Duration(defaultKimiConcurrencyLimitSeconds)*time.Second), repo.lastTempUntil, 2*time.Second)
+	require.Less(t, repo.lastTempUntil.Sub(time.Now()), 2*time.Minute)
 }
 
 func TestHandle403_KimiConcurrencyLimitRepositoryFailureKeepsRuntimeBlock(t *testing.T) {
@@ -236,7 +238,7 @@ func TestHandle403_KimiConcurrencyLimitRepositoryFailureKeepsRuntimeBlock(t *tes
 	require.True(t, blocker.until[0].After(time.Now()))
 }
 
-func TestHandle403_CNProviderNearMatchRetainsNormalPermanentErrorPolicy(t *testing.T) {
+func TestHandle403_CNProviderNearMatchUsesShortConcurrencyCooldown(t *testing.T) {
 	repo := &rateLimitAccountRepoStub{}
 	counter := &openAI403CounterCacheStub{counts: []int64{openAI403DisableThreshold}}
 	service := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
@@ -249,6 +251,8 @@ func TestHandle403_CNProviderNearMatchRetainsNormalPermanentErrorPolicy(t *testi
 	)
 
 	require.True(t, shouldDisable)
-	require.Equal(t, 1, repo.setErrorCalls, "non-exact 403 must retain existing permission/auth protection")
-	require.Equal(t, 0, repo.tempCalls)
+	require.Equal(t, 0, repo.setErrorCalls)
+	require.Equal(t, 1, repo.tempCalls)
+	require.Contains(t, repo.lastTempReason, cnConcurrencyLimitReasonPrefix)
+	require.WithinDuration(t, time.Now().Add(time.Duration(defaultKimiConcurrencyLimitSeconds)*time.Second), repo.lastTempUntil, 2*time.Second)
 }

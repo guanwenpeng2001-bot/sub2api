@@ -1409,14 +1409,7 @@ func writeOpenAIModelsList(c *gin.Context, modelIDs []string) {
 			models = append(models, model)
 			continue
 		}
-		models = append(models, openai.Model{
-			ID:          modelID,
-			Object:      "model",
-			Created:     1704067200,
-			OwnedBy:     "openai",
-			Type:        "model",
-			DisplayName: modelID,
-		})
+		models = append(models, openAIModelForID(modelID))
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"object": "list",

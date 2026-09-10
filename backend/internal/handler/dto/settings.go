@@ -458,6 +458,14 @@ type OpenAIImagesOAuthUnavailableCooldownSettings struct {
 	CooldownMinutes int `json:"cooldown_minutes"`
 }
 
+type ReactiveCooldownSettings struct {
+	PlanGatedMinutes            int `json:"plan_gated_minutes"`
+	ModelNotFoundMinutes        int `json:"model_not_found_minutes"`
+	OpenAI403Minutes            int `json:"openai_403_minutes"`
+	KimiConcurrencyLimitSeconds int `json:"kimi_concurrency_limit_seconds"`
+	ImageCapabilityLossMinutes  int `json:"image_capability_loss_minutes"`
+}
+
 // PanelRateLimitSettings 面板 API 限流配置 DTO
 type PanelRateLimitSettings struct {
 	Enabled     bool `json:"enabled"`

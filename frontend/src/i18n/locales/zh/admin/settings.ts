@@ -1013,6 +1013,17 @@ export default {
         saved: '429 默认回避设置保存成功',
         saveFailed: '保存 429 默认回避设置失败'
       },
+      reactiveCooldown: {
+        title: '响应式冷却',
+        description: '配置 plan-gated、模型未找到、403、Kimi 并发限制与图像能力丢失的冷却时长。默认值与原先硬编码一致。',
+        planGatedMinutes: 'Codex plan-gated 冷却（分钟）',
+        modelNotFoundMinutes: '上游模型未找到冷却（分钟）',
+        openai403Minutes: 'OpenAI / 普通 403 冷却（分钟）',
+        kimiConcurrencySeconds: 'Kimi 并发限制 403 冷却（秒）',
+        imageCapabilityLossMinutes: '图像能力丢失冷却（分钟）',
+        saved: '响应式冷却设置保存成功',
+        saveFailed: '保存响应式冷却设置失败'
+      },
       streamTimeout: {
         title: '流超时处理',
         description: '配置上游响应超时时的账户处理策略，避免问题账户持续被选中',

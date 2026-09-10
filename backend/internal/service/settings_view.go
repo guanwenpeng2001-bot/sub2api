@@ -618,6 +618,59 @@ func DefaultOpenAIImagesOAuthUnavailableCooldownSettings() *OpenAIImagesOAuthUna
 	return &OpenAIImagesOAuthUnavailableCooldownSettings{CooldownMinutes: openAIImagesOAuthUnavailableDefaultCooldownMinutes}
 }
 
+// ReactiveCooldownSettings controls previously hardcoded reactive cooldowns.
+type ReactiveCooldownSettings struct {
+	PlanGatedMinutes            int `json:"plan_gated_minutes"`
+	ModelNotFoundMinutes        int `json:"model_not_found_minutes"`
+	OpenAI403Minutes            int `json:"openai_403_minutes"`
+	KimiConcurrencyLimitSeconds int `json:"kimi_concurrency_limit_seconds"`
+	ImageCapabilityLossMinutes  int `json:"image_capability_loss_minutes"`
+}
+
+const (
+	defaultPlanGatedMinutes            = 30
+	defaultModelNotFoundMinutes        = 30
+	defaultOpenAI403Minutes            = 10
+	defaultKimiConcurrencyLimitSeconds = 30
+	defaultImageCapabilityLossMinutes  = 30
+	maxReactiveCooldownMinutes         = 1440
+	maxKimiConcurrencyLimitSeconds     = 600
+)
+
+func DefaultReactiveCooldownSettings() *ReactiveCooldownSettings {
+	return &ReactiveCooldownSettings{
+		PlanGatedMinutes:            defaultPlanGatedMinutes,
+		ModelNotFoundMinutes:        defaultModelNotFoundMinutes,
+		OpenAI403Minutes:            defaultOpenAI403Minutes,
+		KimiConcurrencyLimitSeconds: defaultKimiConcurrencyLimitSeconds,
+		ImageCapabilityLossMinutes:  defaultImageCapabilityLossMinutes,
+	}
+}
+
+func (s *ReactiveCooldownSettings) normalized() *ReactiveCooldownSettings {
+	defaults := DefaultReactiveCooldownSettings()
+	if s == nil {
+		return defaults
+	}
+	out := *s
+	if out.PlanGatedMinutes < 1 || out.PlanGatedMinutes > maxReactiveCooldownMinutes {
+		out.PlanGatedMinutes = defaults.PlanGatedMinutes
+	}
+	if out.ModelNotFoundMinutes < 1 || out.ModelNotFoundMinutes > maxReactiveCooldownMinutes {
+		out.ModelNotFoundMinutes = defaults.ModelNotFoundMinutes
+	}
+	if out.OpenAI403Minutes < 1 || out.OpenAI403Minutes > maxReactiveCooldownMinutes {
+		out.OpenAI403Minutes = defaults.OpenAI403Minutes
+	}
+	if out.KimiConcurrencyLimitSeconds < 1 || out.KimiConcurrencyLimitSeconds > maxKimiConcurrencyLimitSeconds {
+		out.KimiConcurrencyLimitSeconds = defaults.KimiConcurrencyLimitSeconds
+	}
+	if out.ImageCapabilityLossMinutes < 1 || out.ImageCapabilityLossMinutes > maxReactiveCooldownMinutes {
+		out.ImageCapabilityLossMinutes = defaults.ImageCapabilityLossMinutes
+	}
+	return &out
+}
+
 // DefaultBetaPolicySettings 返回默认的 Beta 策略配置
 //
 // context-1m-2025-08-07 的默认策略：

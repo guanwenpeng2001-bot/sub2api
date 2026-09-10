@@ -32,14 +32,14 @@ const cnConcurrencyLimitReasonPrefix = "cn_concurrency_limit"
 
 func isCNProviderConcurrencyLimit403(account *Account, upstreamMsg string) bool {
 	return account != nil && account.Platform == PlatformKimi &&
-		strings.TrimSpace(upstreamMsg) == kimiConcurrentRequestLimitMessage
+		strings.Contains(strings.ToLower(strings.TrimSpace(upstreamMsg)), "concurrent request limit")
 }
 
 func (s *RateLimitService) handleCNProviderConcurrencyLimit403(
 	ctx context.Context,
 	account *Account,
 ) {
-	until := time.Now().Add(time.Duration(openAI403CooldownMinutesDefault) * time.Minute)
+	until := time.Now().Add(s.kimiConcurrencyLimitCooldown(ctx))
 	reason := cnConcurrencyLimitReasonPrefix + ": " + kimiConcurrentRequestLimitMessage
 	s.notifyAccountSchedulingBlocked(account, until, cnConcurrencyLimitReasonPrefix)
 	if err := s.accountRepo.SetTempUnschedulable(ctx, account.ID, until, reason); err != nil {

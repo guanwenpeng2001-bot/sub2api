@@ -1019,6 +1019,17 @@ export default {
         saved: '429 default cooldown settings saved',
         saveFailed: 'Failed to save 429 default cooldown settings'
       },
+      reactiveCooldown: {
+        title: 'Reactive Cooldowns',
+        description: 'Configure plan-gated, model-not-found, 403, Kimi concurrency-limit, and image-capability-loss cooldowns. Defaults match the previous hardcoded values.',
+        planGatedMinutes: 'Codex plan-gated cooldown (minutes)',
+        modelNotFoundMinutes: 'Upstream model-not-found cooldown (minutes)',
+        openai403Minutes: 'OpenAI / generic 403 cooldown (minutes)',
+        kimiConcurrencySeconds: 'Kimi concurrency-limit 403 cooldown (seconds)',
+        imageCapabilityLossMinutes: 'Image capability loss cooldown (minutes)',
+        saved: 'Reactive cooldown settings saved',
+        saveFailed: 'Failed to save reactive cooldown settings'
+      },
       streamTimeout: {
         title: 'Stream Timeout Handling',
         description: 'Configure account handling strategy when upstream response times out',

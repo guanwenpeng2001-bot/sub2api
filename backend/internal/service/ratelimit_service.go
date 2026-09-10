@@ -122,6 +122,57 @@ func (s *RateLimitService) SetSettingService(settingService *SettingService) {
 	s.settingService = settingService
 }
 
+func (s *RateLimitService) reactiveCooldownSettings(ctx context.Context) *ReactiveCooldownSettings {
+	if s == nil || s.settingService == nil {
+		return DefaultReactiveCooldownSettings()
+	}
+	settings, err := s.settingService.GetReactiveCooldownSettings(ctx)
+	if err != nil || settings == nil {
+		return DefaultReactiveCooldownSettings()
+	}
+	return settings
+}
+
+func (s *RateLimitService) planGatedCooldown(ctx context.Context) time.Duration {
+	minutes := s.reactiveCooldownSettings(ctx).PlanGatedMinutes
+	if minutes < 1 {
+		return upstreamCodexPlanGatedModelCooldown
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+func (s *RateLimitService) modelNotFoundCooldown(ctx context.Context) time.Duration {
+	minutes := s.reactiveCooldownSettings(ctx).ModelNotFoundMinutes
+	if minutes < 1 {
+		return upstreamModelNotFoundCooldown
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+func (s *RateLimitService) openAI403Cooldown(ctx context.Context) time.Duration {
+	minutes := s.reactiveCooldownSettings(ctx).OpenAI403Minutes
+	if minutes < 1 {
+		return time.Duration(openAI403CooldownMinutesDefault) * time.Minute
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+func (s *RateLimitService) kimiConcurrencyLimitCooldown(ctx context.Context) time.Duration {
+	seconds := s.reactiveCooldownSettings(ctx).KimiConcurrencyLimitSeconds
+	if seconds < 1 {
+		return time.Duration(defaultKimiConcurrencyLimitSeconds) * time.Second
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (s *RateLimitService) imageCapabilityLossCooldown(ctx context.Context) time.Duration {
+	minutes := s.reactiveCooldownSettings(ctx).ImageCapabilityLossMinutes
+	if minutes < 1 {
+		return openAIImageCapabilityLossCooldown
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
 // SetTokenCacheInvalidator 设置 token 缓存清理器（可选依赖）
 func (s *RateLimitService) SetTokenCacheInvalidator(invalidator TokenCacheInvalidator) {
 	s.tokenCacheInvalidator = invalidator
@@ -1052,7 +1103,7 @@ func (s *RateLimitService) handleOpenAI403(ctx context.Context, account *Account
 		return true
 	}
 
-	until := time.Now().Add(time.Duration(openAI403CooldownMinutesDefault) * time.Minute)
+	until := time.Now().Add(s.openAI403Cooldown(ctx))
 	reason := fmt.Sprintf("OpenAI 403 temporary cooldown (%d/%d): %s", count, openAI403DisableThreshold, msg)
 	s.notifyAccountSchedulingBlocked(account, until, "openai_403_temp")
 	if err := s.accountRepo.SetTempUnschedulable(ctx, account.ID, until, reason); err != nil {
@@ -2326,7 +2377,7 @@ func (s *RateLimitService) HandleOpenAIImageCapabilityLoss(ctx context.Context, 
 		return false
 	}
 
-	resetAt := time.Now().Add(openAIImageCapabilityLossCooldown)
+	resetAt := time.Now().Add(s.imageCapabilityLossCooldown(ctx))
 	if err := s.accountRepo.SetModelRateLimit(ctx, account.ID, openAIImageGenerationRateLimitKey, resetAt, openAIImageCapabilityLossReason); err != nil {
 		slog.Warn("openai_image_capability_loss_set_model_rate_limit_failed", "account_id", account.ID, "scope", openAIImageGenerationRateLimitKey, "error", err)
 		return true
@@ -2454,9 +2505,9 @@ func (s *RateLimitService) HandleUpstreamModelNotFound(ctx context.Context, acco
 	var reason string
 	switch {
 	case isUpstreamModelNotFoundError(statusCode, responseBody):
-		cooldown, reason = upstreamModelNotFoundCooldown, upstreamModelNotFoundReason
+		cooldown, reason = s.modelNotFoundCooldown(ctx), upstreamModelNotFoundReason
 	case isOpenAIOAuthAccount(account) && isOpenAICodexPlanGatedModelError(statusCode, responseBody):
-		cooldown, reason = upstreamCodexPlanGatedModelCooldown, upstreamCodexPlanGatedModelReason
+		cooldown, reason = s.planGatedCooldown(ctx), upstreamCodexPlanGatedModelReason
 	default:
 		return false
 	}

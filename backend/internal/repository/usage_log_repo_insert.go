@@ -559,6 +559,24 @@ func (r *usageLogRepository) flushCreateBatch(db *sql.DB, batch []usageLogCreate
 	}
 }
 
+const (
+	usageLogBestEffortTimeout       = 10 * time.Second
+	usageLogBestEffortSingleRetries = 3
+)
+
+func insertUsageLogBestEffortSingleWithRetry(db *sql.DB, prepared usageLogInsertPrepared) error {
+	var lastErr error
+	for attempt := 0; attempt < usageLogBestEffortSingleRetries; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), usageLogBestEffortTimeout)
+		lastErr = execUsageLogInsertNoResult(ctx, db, prepared)
+		cancel()
+		if lastErr == nil {
+			return nil
+		}
+	}
+	return lastErr
+}
+
 func (r *usageLogRepository) flushBestEffortBatch(db *sql.DB, batch []usageLogBestEffortRequest) {
 	if len(batch) == 0 {
 		return
@@ -602,14 +620,14 @@ func (r *usageLogRepository) flushBestEffortBatch(db *sql.DB, batch []usageLogBe
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), usageLogBestEffortTimeout)
 	defer cancel()
 
 	query, args := buildUsageLogBestEffortInsertQuery(preparedList)
 	if _, err := db.ExecContext(ctx, query, args...); err != nil {
 		logger.LegacyPrintf("repository.usage_log", "best-effort batch insert failed: %v", err)
 		for _, group := range groupOrder {
-			singleErr := execUsageLogInsertNoResult(ctx, db, group.prepared)
+			singleErr := insertUsageLogBestEffortSingleWithRetry(db, group.prepared)
 			if singleErr != nil {
 				logger.LegacyPrintf("repository.usage_log", "best-effort single fallback insert failed: %v", singleErr)
 			} else if group.prepared.requestID != "" && r != nil && r.bestEffortRecent != nil {

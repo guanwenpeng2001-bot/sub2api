@@ -132,6 +132,13 @@ func TestGatewayCodexModels_NonOpenAIGroupsUseMappedModels(t *testing.T) {
 			modalities: []string{"text"},
 		},
 		{
+			name:       "DeepSeek vision",
+			platform:   service.PlatformDeepseek,
+			model:      "deepseek-v4-flash-vision-exp",
+			efforts:    []string{"low", "high", "max"},
+			modalities: []string{"text", "image"},
+		},
+		{
 			name:       "provider-qualified Claude",
 			platform:   service.PlatformAnthropic,
 			model:      "anthropic/claude-sonnet-4-6",
@@ -435,6 +442,97 @@ func codexReasoningEffortsForTest(levels []codexReasoningLevelForTest) []string 
 		efforts = append(efforts, level.Effort)
 	}
 	return efforts
+}
+
+func TestGatewayRetrieveModel_ExactLowercaseIDFromSameCatalog(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	groupID := int64(31)
+	h := newGatewayModelsHandlerForTest(&gatewayModelsAccountRepoStub{
+		byGroup: map[int64][]service.Account{
+			groupID: {{
+				ID:       1,
+				Platform: service.PlatformOpenAI,
+				Credentials: map[string]any{
+					"model_mapping": map[string]any{"gpt-5.6-sol": "gpt-5.6-sol", "deepseek-v4-flash-vision-exp": "deepseek-v4-flash-vision-exp"},
+				},
+			}},
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/models/GPT-5.6-sol", nil)
+	c.Params = gin.Params{{Key: "model", Value: "GPT-5.6-sol"}}
+	c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{
+		Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI},
+	})
+	h.RetrieveModel(c)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Empty(t, rec.Header().Get("ETag"))
+	var got gatewayModelItemForTest
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Equal(t, "gpt-5.6-sol", got.ID)
+	require.Equal(t, "model", got.Object)
+	require.NotContains(t, rec.Body.String(), `"data"`)
+}
+
+func TestGatewayRetrieveModel_UnknownIDIs404(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	groupID := int64(32)
+	h := newGatewayModelsHandlerForTest(&gatewayModelsAccountRepoStub{
+		byGroup: map[int64][]service.Account{
+			groupID: {{
+				ID:       1,
+				Platform: service.PlatformOpenAI,
+				Credentials: map[string]any{
+					"model_mapping": map[string]any{"gpt-5.6-sol": "gpt-5.6-sol"},
+				},
+			}},
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/models/gpt-5.6-sol-missing", nil)
+	c.Params = gin.Params{{Key: "model", Value: "gpt-5.6-sol-missing"}}
+	c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{
+		Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI},
+	})
+	h.RetrieveModel(c)
+
+	require.Equal(t, http.StatusNotFound, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "model_not_found")
+	require.NotContains(t, rec.Body.String(), "gpt-5.6-sol-missing-extra")
+}
+
+func TestGatewayRetrieveModel_IgnoresClientVersionQuery(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	groupID := int64(33)
+	h := newGatewayModelsHandlerForTest(&gatewayModelsAccountRepoStub{
+		byGroup: map[int64][]service.Account{
+			groupID: {{
+				ID:       1,
+				Platform: service.PlatformDeepseek,
+				Credentials: map[string]any{
+					"model_mapping": map[string]any{"deepseek-v4-pro": "deepseek-v4-pro"},
+				},
+			}},
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/models/deepseek-v4-pro?client_version=0.147.0", nil)
+	c.Params = gin.Params{{Key: "model", Value: "deepseek-v4-pro"}}
+	c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{
+		Group: &service.Group{ID: groupID, Platform: service.PlatformDeepseek},
+	})
+	h.RetrieveModel(c)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.NotContains(t, rec.Body.String(), `"slug"`)
+	require.Contains(t, rec.Body.String(), `"id":"deepseek-v4-pro"`)
 }
 
 func TestGatewayModels_GeminiGroupFallsBackToGeminiModels(t *testing.T) {

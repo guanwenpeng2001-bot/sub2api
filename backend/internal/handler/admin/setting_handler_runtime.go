@@ -181,6 +181,60 @@ func (h *SettingHandler) UpdateOpenAIImagesOAuthUnavailableCooldownSettings(c *g
 	response.Success(c, dto.OpenAIImagesOAuthUnavailableCooldownSettings{CooldownMinutes: settings.CooldownMinutes})
 }
 
+func (h *SettingHandler) GetReactiveCooldownSettings(c *gin.Context) {
+	settings, err := h.settingService.GetReactiveCooldownSettings(c.Request.Context())
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, dto.ReactiveCooldownSettings{
+		PlanGatedMinutes:            settings.PlanGatedMinutes,
+		ModelNotFoundMinutes:        settings.ModelNotFoundMinutes,
+		OpenAI403Minutes:            settings.OpenAI403Minutes,
+		KimiConcurrencyLimitSeconds: settings.KimiConcurrencyLimitSeconds,
+		ImageCapabilityLossMinutes:  settings.ImageCapabilityLossMinutes,
+	})
+}
+
+type UpdateReactiveCooldownSettingsRequest struct {
+	PlanGatedMinutes            int `json:"plan_gated_minutes"`
+	ModelNotFoundMinutes        int `json:"model_not_found_minutes"`
+	OpenAI403Minutes            int `json:"openai_403_minutes"`
+	KimiConcurrencyLimitSeconds int `json:"kimi_concurrency_limit_seconds"`
+	ImageCapabilityLossMinutes  int `json:"image_capability_loss_minutes"`
+}
+
+func (h *SettingHandler) UpdateReactiveCooldownSettings(c *gin.Context) {
+	var req UpdateReactiveCooldownSettingsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+	settings := &service.ReactiveCooldownSettings{
+		PlanGatedMinutes:            req.PlanGatedMinutes,
+		ModelNotFoundMinutes:        req.ModelNotFoundMinutes,
+		OpenAI403Minutes:            req.OpenAI403Minutes,
+		KimiConcurrencyLimitSeconds: req.KimiConcurrencyLimitSeconds,
+		ImageCapabilityLossMinutes:  req.ImageCapabilityLossMinutes,
+	}
+	if err := h.settingService.SetReactiveCooldownSettings(c.Request.Context(), settings); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	updated, err := h.settingService.GetReactiveCooldownSettings(c.Request.Context())
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, dto.ReactiveCooldownSettings{
+		PlanGatedMinutes:            updated.PlanGatedMinutes,
+		ModelNotFoundMinutes:        updated.ModelNotFoundMinutes,
+		OpenAI403Minutes:            updated.OpenAI403Minutes,
+		KimiConcurrencyLimitSeconds: updated.KimiConcurrencyLimitSeconds,
+		ImageCapabilityLossMinutes:  updated.ImageCapabilityLossMinutes,
+	})
+}
+
 // GetPanelRateLimitSettings 获取面板 API 限流配置
 // GET /api/v1/admin/settings/panel-rate-limit
 func (h *SettingHandler) GetPanelRateLimitSettings(c *gin.Context) {
