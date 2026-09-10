@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"github.com/Wei-Shaw/sub2api/internal/config"
+	"errors"
 	"strconv"
+	"strings"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/handler/dto"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -78,48 +80,53 @@ func (h *AdminAPIKeyHandler) CreateUserAPIKey(c *gin.Context) {
 		return
 	}
 	coordinator := service.DefaultIdempotencyCoordinator()
-	if coordinator == nil || h.config == nil || h.config.JWT.Secret == "" {
+	if coordinator == nil || h.config == nil {
 		response.ErrorFrom(c, service.ErrIdempotencyStoreUnavail)
 		return
 	}
-	scope := "admin.user-api-key:" + adminActorScope(c) + ":" + strconv.FormatInt(userID, 10)
-	// The unique credential closes the create/MarkSucceeded crash window.
-	// Domain separation and the server secret keep public request keys non-secret.
-	mac := hmac.New(sha256.New, []byte(h.config.JWT.Secret))
-	mac.Write([]byte(scope + ":" + idempotencyKey))
-	credential := "sk-" + hex.EncodeToString(mac.Sum(nil))
-	find := func(ctx context.Context) (*service.APIKey, error) {
-		for page := 1; ; page++ {
-			keys, total, listErr := h.adminService.GetUserAPIKeys(ctx, userID, page, 100, "id", "asc")
-			if listErr != nil {
-				return nil, listErr
-			}
-			for _, key := range keys {
-				if key.UserID == userID && key.Key == credential {
-					return &key, nil
-				}
-			}
-			if int64(page*100) >= total || len(keys) == 0 {
-				return nil, nil
-			}
+	scope := "admin.user-api-key:" + strconv.FormatInt(userID, 10)
+	// Successful replays use the stored row ID, never a newly derived credential.
+	find := func(ctx context.Context, credential string) (*service.APIKey, error) {
+		key, err := h.apiKeyService.GetStoredByKey(ctx, credential)
+		if errors.Is(err, service.ErrAPIKeyNotFound) {
+			return nil, nil
 		}
+		if err != nil {
+			return nil, err
+		}
+		if key == nil || key.UserID != userID {
+			return nil, service.ErrAPIKeyExists
+		}
+		return key, nil
 	}
 	result, err := coordinator.Execute(c.Request.Context(), service.IdempotencyExecuteOptions{
-		Scope: scope, ActorScope: adminActorScope(c), Method: c.Request.Method,
+		Scope: scope, ActorScope: scope, Method: c.Request.Method,
 		Route: c.FullPath(), IdempotencyKey: idempotencyKey, Payload: req,
-		RequireKey: true, ReclaimExpiredProcessing: true, TTL: service.DefaultWriteIdempotencyTTL(),
+		RequireKey: true, ReclaimExpiredProcessing: true, RetainSucceeded: true, TTL: service.DefaultWriteIdempotencyTTL(),
 	}, func(ctx context.Context) (any, error) {
-		key, findErr := find(ctx)
+		secret := strings.TrimSpace(h.config.APIKeyIdemHMACSecret)
+		if secret == "" {
+			if h.config.JWT.Secret == "" {
+				return nil, service.ErrIdempotencyStoreUnavail
+			}
+			derived := hmac.New(sha256.New, []byte(h.config.JWT.Secret))
+			derived.Write([]byte("sub2api/api-key-idempotency/hmac/v1"))
+			secret = string(derived.Sum(nil))
+		}
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write([]byte(scope + ":" + idempotencyKey))
+		credential := "sk-" + hex.EncodeToString(mac.Sum(nil))
+		key, findErr := find(ctx, credential)
 		if findErr != nil {
 			return nil, findErr
 		}
 		if key == nil {
 			key, findErr = h.apiKeyService.Create(ctx, userID, service.CreateAPIKeyRequest{
-				Name: req.Name, GroupID: req.GroupID, CustomKey: &credential,
+				Name: req.Name, GroupID: req.GroupID, CustomKey: &credential, SkipCustomKeyRateLimit: true,
 			})
 			if findErr != nil {
 				// A duplicate writer or a lost database response may have won.
-				recovered, recoveryErr := find(ctx)
+				recovered, recoveryErr := find(ctx, credential)
 				if recoveryErr != nil || recovered == nil {
 					return nil, findErr
 				}

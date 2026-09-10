@@ -22,7 +22,7 @@ import (
 //
 // 配置（环境变量）：
 //
-//	UPSTREAM_MODEL_SYNC_ENABLED                  "false" 关闭（默认开启）
+//	UPSTREAM_MODEL_SYNC_ENABLED                  "false" 关闭（默认关闭）
 //	UPSTREAM_MODEL_SYNC_INTERVAL_HOURS           周期小时数（默认 24）
 //	UPSTREAM_MODEL_SYNC_ACCOUNT_TIMEOUT_SECONDS  单账号超时秒数（默认 120）
 type UpstreamModelSyncScheduler struct {
@@ -63,7 +63,7 @@ type upstreamModelSyncConfig struct {
 }
 
 func defaultUpstreamModelSyncConfig() upstreamModelSyncConfig {
-	return upstreamModelSyncConfig{true, defaultUpstreamModelSyncIntervalHours * time.Hour, defaultUpstreamModelSyncAccountTimeout}
+	return upstreamModelSyncConfig{false, defaultUpstreamModelSyncIntervalHours * time.Hour, defaultUpstreamModelSyncAccountTimeout}
 }
 
 func parseUpstreamModelSyncDuration(raw string) (time.Duration, error) {
@@ -262,7 +262,7 @@ func (s *UpstreamModelSyncScheduler) runLoop() {
 	defer retry.Stop()
 	var retries <-chan time.Time
 	backoff := time.Second
-	reload := func() bool {
+	reload := func() (changed bool, ok bool) {
 		if !retry.Stop() {
 			select {
 			case <-retry.C:
@@ -270,19 +270,19 @@ func (s *UpstreamModelSyncScheduler) runLoop() {
 			}
 		}
 		retries = nil
-		_, err := s.reloadConfig()
+		changed, err := s.reloadConfig()
 		if err != nil {
 			slog.Error("reload upstream model sync settings; retrying", "error", err)
 			retry.Reset(backoff)
 			retries = retry.C
 			backoff = min(backoff*2, time.Minute)
-			return false
+			return false, false
 		}
 		backoff = time.Second
-		return true
+		return changed, true
 	}
 	reset()
-	if !reload() {
+	if _, ok := reload(); !ok {
 		ticks = nil
 	} else {
 		reset()
@@ -292,15 +292,15 @@ func (s *UpstreamModelSyncScheduler) runLoop() {
 		case <-s.parentCtx.Done():
 			return
 		case <-s.wake:
-			if reload() {
+			if changed, ok := reload(); ok && (changed || ticks == nil) {
 				reset()
 			}
 		case <-retries:
-			if reload() {
+			if changed, ok := reload(); ok && (changed || ticks == nil) {
 				reset()
 			}
 		case <-ticks:
-			if reload() {
+			if _, ok := reload(); ok {
 				s.mu.Lock()
 				enabled := s.config.enabled
 				s.mu.Unlock()

@@ -241,3 +241,60 @@ func TestUpstreamModelSyncSchedulerRecoversWithoutNotification(t *testing.T) {
 		})
 	}
 }
+
+func TestUpstreamModelSyncDefaultDisabled(t *testing.T) {
+	require.False(t, defaultUpstreamModelSyncConfig().enabled)
+}
+
+func TestUpstreamModelSyncUnchangedWakeKeepsDeadline(t *testing.T) {
+	t.Setenv("UPSTREAM_MODEL_SYNC_ENABLED", "")
+	t.Setenv("UPSTREAM_MODEL_SYNC_INTERVAL_HOURS", "")
+	t.Setenv("UPSTREAM_MODEL_SYNC_ACCOUNT_TIMEOUT_SECONDS", "")
+	s := newUpstreamModelSyncScheduler(&upstreamModelSyncListerStub{accounts: []Account{{ID: 1}}}, nil,
+		upstreamModelSyncConfig{true, 100 * time.Millisecond, time.Second})
+	var synced atomic.Int32
+	s.syncAccount = func(context.Context, *Account) error { synced.Add(1); return nil }
+	s.Start()
+	defer s.Stop()
+	// Notifications keep arriving faster than the interval. Resetting on each
+	// notification would starve the scheduled cycle throughout this window.
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.After(time.Second)
+	for synced.Load() == 0 {
+		select {
+		case <-ticker.C:
+			select {
+			case s.wake <- struct{}{}:
+			default:
+			}
+		case <-deadline:
+			t.Fatal("unchanged settings postponed every cycle")
+		}
+	}
+}
+
+func TestUpstreamModelSyncReloadDetectsOnlySyncConfigChanges(t *testing.T) {
+	t.Setenv("UPSTREAM_MODEL_SYNC_ENABLED", "")
+	t.Setenv("UPSTREAM_MODEL_SYNC_INTERVAL_HOURS", "")
+	t.Setenv("UPSTREAM_MODEL_SYNC_ACCOUNT_TIMEOUT_SECONDS", "")
+	s := newUpstreamModelSyncScheduler(nil, nil, defaultUpstreamModelSyncConfig())
+	defer s.Stop()
+	changed, err := s.reloadConfig()
+	require.NoError(t, err)
+	require.False(t, changed)
+	for _, setting := range []struct{ key, value string }{
+		{"UPSTREAM_MODEL_SYNC_ENABLED", "true"},
+		{"UPSTREAM_MODEL_SYNC_INTERVAL_HOURS", "12"},
+		{"UPSTREAM_MODEL_SYNC_ACCOUNT_TIMEOUT_SECONDS", "60"},
+		{"UPSTREAM_MODEL_SYNC_ENABLED", "false"},
+	} {
+		t.Setenv(setting.key, setting.value)
+		changed, err = s.reloadConfig()
+		require.NoError(t, err)
+		require.True(t, changed, setting.key)
+		changed, err = s.reloadConfig()
+		require.NoError(t, err)
+		require.False(t, changed, setting.key)
+	}
+}

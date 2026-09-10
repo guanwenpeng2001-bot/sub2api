@@ -79,6 +79,9 @@ func DefaultIdempotencyConfig() IdempotencyConfig {
 }
 
 type IdempotencyExecuteOptions struct {
+	// Keep a successful resource reference beyond the normal cleanup TTL.
+	// Use only for durable resource creation; processing/failure locks still expire.
+	RetainSucceeded bool
 	// Only enable when the executor itself has a durable uniqueness constraint.
 	ReclaimExpiredProcessing bool
 	Scope                    string
@@ -436,6 +439,11 @@ func (c *IdempotencyCoordinator) Execute(
 			"operation": "marshal_response",
 		})
 		return nil, ErrIdempotencyStoreUnavail.WithCause(marshalErr)
+	}
+	if opts.RetainSucceeded {
+		// A portable finite timestamp preserves the reference without changing the
+		// non-null SQL schema or cleanup semantics for other operations.
+		expiresAt = time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC)
 	}
 	if markErr := c.repo.MarkSucceeded(ctx, record.ID, 200, storedBody, expiresAt); markErr != nil {
 		RecordIdempotencyStoreUnavailable(opts.Route, opts.Scope, "mark_succeeded_error")

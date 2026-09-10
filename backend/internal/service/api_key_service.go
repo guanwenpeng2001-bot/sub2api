@@ -209,11 +209,13 @@ type APIKeyAuthCacheInvalidator interface {
 
 // CreateAPIKeyRequest 创建API Key请求
 type CreateAPIKeyRequest struct {
-	Name        string   `json:"name"`
-	GroupID     *int64   `json:"group_id"`
-	CustomKey   *string  `json:"custom_key"`   // 可选的自定义key
-	IPWhitelist []string `json:"ip_whitelist"` // IP 白名单
-	IPBlacklist []string `json:"ip_blacklist"` // IP 黑名单
+	// Trusted admin callers only; never accept this flag from JSON.
+	SkipCustomKeyRateLimit bool     `json:"-"`
+	Name                   string   `json:"name"`
+	GroupID                *int64   `json:"group_id"`
+	CustomKey              *string  `json:"custom_key"`   // 可选的自定义key
+	IPWhitelist            []string `json:"ip_whitelist"` // IP 白名单
+	IPBlacklist            []string `json:"ip_blacklist"` // IP 黑名单
 
 	// Quota fields
 	Quota         float64 `json:"quota"`           // Quota limit in USD (0 = unlimited)
@@ -500,8 +502,10 @@ func (s *APIKeyService) Create(ctx context.Context, userID int64, req CreateAPIK
 	// 判断是否使用自定义Key
 	if req.CustomKey != nil && *req.CustomKey != "" {
 		// 检查限流（仅对自定义key进行限流）
-		if err := s.checkAPIKeyRateLimit(ctx, userID); err != nil {
-			return nil, err
+		if !req.SkipCustomKeyRateLimit {
+			if err := s.checkAPIKeyRateLimit(ctx, userID); err != nil {
+				return nil, err
+			}
 		}
 
 		// 验证自定义Key格式
@@ -516,7 +520,9 @@ func (s *APIKeyService) Create(ctx context.Context, userID int64, req CreateAPIK
 		}
 		if exists {
 			// Key已存在，增加错误计数
-			s.incrementAPIKeyErrorCount(ctx, userID)
+			if !req.SkipCustomKeyRateLimit {
+				s.incrementAPIKeyErrorCount(ctx, userID)
+			}
 			return nil, ErrAPIKeyExists
 		}
 
@@ -698,6 +704,12 @@ func (s *APIKeyService) GetByID(ctx context.Context, id int64) (*APIKey, error) 
 		apiKey.CurrentConcurrency = s.currentConcurrencyForAPIKey(ctx, apiKey.ID)
 	}
 	return apiKey, nil
+}
+
+// GetStoredByKey reads the complete owning row without authentication caches.
+// Management recovery must observe a just-created key even after an auth miss.
+func (s *APIKeyService) GetStoredByKey(ctx context.Context, key string) (*APIKey, error) {
+	return s.apiKeyRepo.GetByKey(ctx, key)
 }
 
 // GetByKey 根据Key字符串获取API Key（用于认证）

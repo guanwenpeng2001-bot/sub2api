@@ -2630,3 +2630,11 @@ func TestLoad_DefaultGatewayImageStreamConfig(t *testing.T) {
 		t.Fatalf("image stream timeout = %d, want greater than ordinary stream timeout %d", cfg.Gateway.ImageStreamDataIntervalTimeout, cfg.Gateway.StreamDataIntervalTimeout)
 	}
 }
+
+func TestLoadAPIKeyIdempotencyHMACSecret(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	t.Setenv("API_KEY_IDEM_HMAC_SECRET", "independent-mint-secret")
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.Equal(t, "independent-mint-secret", cfg.APIKeyIdemHMACSecret)
+}

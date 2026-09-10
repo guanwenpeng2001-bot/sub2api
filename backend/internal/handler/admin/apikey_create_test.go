@@ -26,6 +26,7 @@ type mintKeyRepo struct {
 	service.APIKeyRepository
 	keys    []service.APIKey
 	creates int
+	lists   int
 	err     error
 }
 
@@ -52,8 +53,8 @@ type mintUserRepo struct {
 }
 
 func (r *mintUserRepo) GetByID(_ context.Context, id int64) (*service.User, error) {
-	if id == 1 {
-		return &service.User{ID: 1, Role: service.RoleAdmin, Status: service.StatusActive}, nil
+	if id == 1 || id == 3 {
+		return &service.User{ID: id, Role: service.RoleAdmin, Status: service.StatusActive}, nil
 	}
 	if id == 2 {
 		return &service.User{ID: 2, Role: service.RoleUser, Status: service.StatusActive}, nil
@@ -122,6 +123,7 @@ type mintAdminService struct {
 }
 
 func (s *mintAdminService) GetUserAPIKeys(_ context.Context, userID int64, _, _ int, _, _ string) ([]service.APIKey, int64, error) {
+	s.repo.lists++
 	keys := []service.APIKey{}
 	for _, key := range s.repo.keys {
 		if key.UserID == userID {
@@ -132,6 +134,7 @@ func (s *mintAdminService) GetUserAPIKeys(_ context.Context, userID int64, _, _ 
 }
 
 type mintFixture struct {
+	cfg                   *config.Config
 	router                *gin.Engine
 	keys                  *mintKeyRepo
 	users                 *mintUserRepo
@@ -150,6 +153,7 @@ func newMintFixture(t *testing.T) *mintFixture {
 		subs:   &mintSubscriptionRepo{},
 	}
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: "mint-test-secret", ExpireHour: 1}}
+	f.cfg = cfg
 	auth := service.NewAuthService(nil, nil, nil, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil)
 	var err error
 	f.adminToken, err = auth.GenerateToken(context.Background(), &service.User{ID: 1, Role: service.RoleAdmin})
@@ -496,7 +500,7 @@ func TestAdminCreateAPIKey_IdempotencyReplayAndCrashRecovery(t *testing.T) {
 			require.Equal(t, 1, f.keys.creates)
 			deleted, err := repo.DeleteExpired(context.Background(), time.Now().Add(48*time.Hour), 100)
 			require.NoError(t, err)
-			require.Equal(t, int64(1), deleted)
+			require.Zero(t, deleted, "successful mint references must survive ordinary cleanup")
 			replayAfterCleanup := mintReplayRequest(f, "42", "intent-1", `{"name":"integration","group_id":7}`)
 			require.Equal(t, 200, replayAfterCleanup.Code)
 			require.Equal(t, 1, f.keys.creates)
@@ -539,4 +543,106 @@ func TestAdminCreateAPIKey_ConcurrentIdempotencyAndUserIsolation(t *testing.T) {
 	require.Equal(t, 2, f.keys.creates)
 	require.NotEqual(t, f.keys.keys[0].Key, f.keys.keys[1].Key)
 	require.NotEqual(t, first.Body.String(), other.Body.String())
+}
+
+func (r *mintKeyRepo) GetByKey(_ context.Context, credential string) (*service.APIKey, error) {
+	for _, key := range r.keys {
+		if key.Key == credential {
+			return &key, nil
+		}
+	}
+	return nil, service.ErrAPIKeyNotFound
+}
+
+func TestAdminCreateAPIKey_ReplayAfterSecretRotation(t *testing.T) {
+	f := newMintFixture(t)
+	repo := &mintIdempotencyRepo{rows: make(map[string]*service.IdempotencyRecord)}
+	service.SetDefaultIdempotencyCoordinator(service.NewIdempotencyCoordinator(repo, service.DefaultIdempotencyConfig()))
+	t.Cleanup(func() { service.SetDefaultIdempotencyCoordinator(nil) })
+	first := mintReplayRequest(f, "42", "rotate", `{"name":"integration"}`)
+	require.Equal(t, 200, first.Code, first.Body.String())
+	deleted, err := repo.DeleteExpired(context.Background(), time.Now().Add(48*time.Hour), 100)
+	require.NoError(t, err)
+	require.Zero(t, deleted)
+	f.cfg.JWT.Secret = "rotated-jwt-secret"
+	f.cfg.APIKeyIdemHMACSecret = "new-independent-secret"
+	second := mintReplayRequest(f, "42", "rotate", `{"name":"integration"}`)
+	require.Equal(t, 200, second.Code, second.Body.String())
+	require.Equal(t, first.Body.String(), second.Body.String())
+	require.Equal(t, "true", second.Header().Get("X-Idempotency-Replayed"))
+	require.Equal(t, 1, f.keys.creates)
+}
+
+func TestAdminCreateAPIKey_IndependentSecretSurvivesCleanupAndJWTRotation(t *testing.T) {
+	f := newMintFixture(t)
+	f.cfg.APIKeyIdemHMACSecret = "independent-stable-secret"
+	repo := &mintIdempotencyRepo{rows: make(map[string]*service.IdempotencyRecord)}
+	service.SetDefaultIdempotencyCoordinator(service.NewIdempotencyCoordinator(repo, service.DefaultIdempotencyConfig()))
+	t.Cleanup(func() { service.SetDefaultIdempotencyCoordinator(nil) })
+	first := mintReplayRequest(f, "42", "rotate", `{"name":"integration"}`)
+	require.Equal(t, 200, first.Code)
+	// Simulate explicit loss of the coordination record; the stable independent
+	// secret still permits recovery from the API key row by its unique key.
+	repo.rows = make(map[string]*service.IdempotencyRecord)
+	f.cfg.JWT.Secret = ""
+	second := mintReplayRequest(f, "42", "rotate", `{"name":"integration"}`)
+	require.Equal(t, 200, second.Code, second.Body.String())
+	require.Equal(t, first.Body.String(), second.Body.String())
+	require.Equal(t, 1, f.keys.creates)
+}
+
+func TestAdminCreateAPIKey_ReplayAcrossAdministrators(t *testing.T) {
+	f := newMintFixture(t)
+	repo := &mintIdempotencyRepo{rows: make(map[string]*service.IdempotencyRecord)}
+	service.SetDefaultIdempotencyCoordinator(service.NewIdempotencyCoordinator(repo, service.DefaultIdempotencyConfig()))
+	t.Cleanup(func() { service.SetDefaultIdempotencyCoordinator(nil) })
+	first := mintReplayRequest(f, "42", "shared", `{"name":"integration"}`)
+	require.Equal(t, 200, first.Code)
+	auth := service.NewAuthService(nil, nil, nil, nil, f.cfg, nil, nil, nil, nil, nil, nil, nil, nil)
+	token, err := auth.GenerateToken(context.Background(), &service.User{ID: 3, Role: service.RoleAdmin})
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/users/42/api-keys", strings.NewReader(`{"name":"integration"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Idempotency-Key", "shared")
+	second := httptest.NewRecorder()
+	f.router.ServeHTTP(second, req)
+	require.Equal(t, 200, second.Code, second.Body.String())
+	require.Equal(t, "true", second.Header().Get("X-Idempotency-Replayed"))
+	require.Equal(t, first.Body.String(), second.Body.String())
+	require.Equal(t, 1, f.keys.creates)
+}
+
+func TestAdminCreateAPIKey_RecoveryValidatesOwnerWithoutListing(t *testing.T) {
+	f := newMintFixture(t)
+	repo := &mintIdempotencyRepo{rows: make(map[string]*service.IdempotencyRecord)}
+	service.SetDefaultIdempotencyCoordinator(service.NewIdempotencyCoordinator(repo, service.DefaultIdempotencyConfig()))
+	t.Cleanup(func() { service.SetDefaultIdempotencyCoordinator(nil) })
+	first := mintReplayRequest(f, "42", "owner", `{"name":"integration"}`)
+	require.Equal(t, 200, first.Code, first.Body.String())
+	originalKey := f.keys.keys[0].Key
+	// Force recovery through the unique credential, then simulate a row owned
+	// by another user. Neither recovery nor replay may disclose that credential.
+	repo.rows = make(map[string]*service.IdempotencyRecord)
+	f.keys.keys[0].UserID = 99
+	second := mintReplayRequest(f, "42", "owner", `{"name":"integration"}`)
+	require.Equal(t, 409, second.Code, second.Body.String())
+	require.NotContains(t, second.Body.String(), originalKey)
+	require.Equal(t, 1, f.keys.creates)
+	require.Zero(t, f.keys.lists)
+}
+
+func TestAdminCreateAPIKey_ReplayMissingRowDoesNotMintReplacement(t *testing.T) {
+	f := newMintFixture(t)
+	repo := &mintIdempotencyRepo{rows: make(map[string]*service.IdempotencyRecord)}
+	service.SetDefaultIdempotencyCoordinator(service.NewIdempotencyCoordinator(repo, service.DefaultIdempotencyConfig()))
+	t.Cleanup(func() { service.SetDefaultIdempotencyCoordinator(nil) })
+	first := mintReplayRequest(f, "42", "deleted", `{"name":"integration"}`)
+	require.Equal(t, 200, first.Code, first.Body.String())
+	f.keys.keys = nil
+	f.cfg.JWT.Secret = "rotated"
+	second := mintReplayRequest(f, "42", "deleted", `{"name":"integration"}`)
+	require.Equal(t, 503, second.Code, second.Body.String())
+	require.Equal(t, 1, f.keys.creates)
+	require.Zero(t, f.keys.lists)
 }
