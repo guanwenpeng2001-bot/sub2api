@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/handler"
@@ -28,6 +30,11 @@ type mintKeyRepo struct {
 }
 
 func (r *mintKeyRepo) Create(_ context.Context, key *service.APIKey) error {
+	for _, existing := range r.keys {
+		if existing.Key == key.Key {
+			return service.ErrAPIKeyExists
+		}
+	}
 	r.creates++
 	if r.err != nil {
 		return r.err
@@ -154,7 +161,7 @@ func newMintFixture(t *testing.T) *mintFixture {
 	keys := service.NewAPIKeyService(f.keys, f.users, f.groups, f.subs, nil, nil, cfg)
 	adminSvc := &mintAdminService{repo: f.keys}
 	h := &handler.Handlers{Admin: &handler.AdminHandlers{
-		APIKey: adminhandler.NewAdminAPIKeyHandler(adminSvc, keys),
+		APIKey: adminhandler.NewAdminAPIKeyHandler(adminSvc, keys, cfg),
 		User:   adminhandler.NewUserHandler(adminSvc, nil, nil, nil, nil, nil, nil),
 	}}
 	f.router = gin.New()
@@ -347,4 +354,189 @@ func TestAdminAPIKeyRoutes_RejectUnauthorizedIdentities(t *testing.T) {
 			})
 		}
 	}
+}
+
+func (r *mintKeyRepo) ExistsByKey(_ context.Context, credential string) (bool, error) {
+	for _, key := range r.keys {
+		if key.Key == credential {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+func (r *mintKeyRepo) GetByID(_ context.Context, id int64) (*service.APIKey, error) {
+	for _, key := range r.keys {
+		if key.ID == id {
+			return &key, nil
+		}
+	}
+	return nil, service.ErrAPIKeyNotFound
+}
+
+type mintIdempotencyRepo struct {
+	service.IdempotencyRepository
+	mu       sync.Mutex
+	rows     map[string]*service.IdempotencyRecord
+	failMark bool
+}
+
+func (r *mintIdempotencyRepo) CreateProcessing(_ context.Context, record *service.IdempotencyRecord) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	k := record.Scope + record.IdempotencyKeyHash
+	if r.rows[k] != nil {
+		return false, nil
+	}
+	record.ID = int64(len(r.rows) + 1)
+	clone := *record
+	r.rows[k] = &clone
+	return true, nil
+}
+func (r *mintIdempotencyRepo) GetByScopeAndKeyHash(_ context.Context, scope, key string) (*service.IdempotencyRecord, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	clone := *r.rows[scope+key]
+	return &clone, nil
+}
+func (r *mintIdempotencyRepo) TryReclaim(_ context.Context, id int64, status string, now, locked, expires time.Time) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, row := range r.rows {
+		if row.ID == id && row.Status == status && (row.LockedUntil == nil || !row.LockedUntil.After(now)) {
+			row.Status = service.IdempotencyStatusProcessing
+			row.LockedUntil = &locked
+			row.ExpiresAt = expires
+			return true, nil
+		}
+	}
+	return false, nil
+}
+func (r *mintIdempotencyRepo) MarkSucceeded(_ context.Context, id int64, status int, body string, expires time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failMark {
+		r.failMark = false
+		return errors.New("lost persistence")
+	}
+	for _, row := range r.rows {
+		if row.ID == id {
+			row.Status = service.IdempotencyStatusSucceeded
+			row.ResponseStatus = &status
+			row.ResponseBody = &body
+			row.ExpiresAt = expires
+			row.LockedUntil = nil
+		}
+	}
+	return nil
+}
+func (r *mintIdempotencyRepo) MarkFailedRetryable(_ context.Context, id int64, reason string, locked, expires time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, row := range r.rows {
+		if row.ID == id {
+			row.Status = service.IdempotencyStatusFailedRetryable
+			row.LockedUntil = &locked
+			row.ExpiresAt = expires
+		}
+	}
+	return nil
+}
+func (r *mintIdempotencyRepo) DeleteExpired(_ context.Context, now time.Time, limit int) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var deleted int64
+	for k, row := range r.rows {
+		if !row.ExpiresAt.After(now) && int(deleted) < limit {
+			delete(r.rows, k)
+			deleted++
+		}
+	}
+	return deleted, nil
+}
+func mintReplayRequest(f *mintFixture, id, key, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/users/"+id+"/api-keys", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", "test-admin-key")
+	req.Header.Set("Idempotency-Key", key)
+	rec := httptest.NewRecorder()
+	f.router.ServeHTTP(rec, req)
+	return rec
+}
+func TestAdminCreateAPIKey_IdempotencyReplayAndCrashRecovery(t *testing.T) {
+	for _, crash := range []bool{false, true} {
+		t.Run(map[bool]string{false: "replay", true: "crash-before-result"}[crash], func(t *testing.T) {
+			f := newMintFixture(t)
+			repo := &mintIdempotencyRepo{rows: make(map[string]*service.IdempotencyRecord), failMark: crash}
+			cfg := service.DefaultIdempotencyConfig()
+			cfg.ProcessingTimeout = -time.Second
+			cfg.FailedRetryBackoff = -time.Second
+			service.SetDefaultIdempotencyCoordinator(service.NewIdempotencyCoordinator(repo, cfg))
+			t.Cleanup(func() { service.SetDefaultIdempotencyCoordinator(nil) })
+			first := mintReplayRequest(f, "42", "intent-1", `{"name":"integration","group_id":7}`)
+			if crash {
+				require.Equal(t, 503, first.Code, first.Body.String())
+			} else {
+				require.Equal(t, 200, first.Code, first.Body.String())
+			}
+			require.Equal(t, 1, f.keys.creates)
+			// A fresh coordinator represents restart with the same persisted repository.
+			service.SetDefaultIdempotencyCoordinator(service.NewIdempotencyCoordinator(repo, cfg))
+			second := mintReplayRequest(f, "42", "intent-1", `{"name":"integration","group_id":7}`)
+			require.Equal(t, 200, second.Code, second.Body.String())
+			require.Equal(t, 1, f.keys.creates)
+			third := mintReplayRequest(f, "42", "intent-1", `{"name":"integration","group_id":7}`)
+			require.Equal(t, second.Body.String(), third.Body.String())
+			require.Equal(t, "true", third.Header().Get("X-Idempotency-Replayed"))
+			require.Contains(t, third.Body.String(), f.keys.keys[0].Key)
+			for _, row := range repo.rows {
+				require.NotContains(t, *row.ResponseBody, f.keys.keys[0].Key)
+			}
+			conflict := mintReplayRequest(f, "42", "intent-1", `{"name":"changed","group_id":7}`)
+			require.Equal(t, 409, conflict.Code)
+			require.Equal(t, 1, f.keys.creates)
+			deleted, err := repo.DeleteExpired(context.Background(), time.Now().Add(48*time.Hour), 100)
+			require.NoError(t, err)
+			require.Equal(t, int64(1), deleted)
+			replayAfterCleanup := mintReplayRequest(f, "42", "intent-1", `{"name":"integration","group_id":7}`)
+			require.Equal(t, 200, replayAfterCleanup.Code)
+			require.Equal(t, 1, f.keys.creates)
+		})
+	}
+}
+func TestAdminCreateAPIKey_IdempotencyUnavailableAndInvalid(t *testing.T) {
+	service.SetDefaultIdempotencyCoordinator(nil)
+	f := newMintFixture(t)
+	require.Equal(t, 503, mintReplayRequest(f, "42", "intent", `{"name":"integration"}`).Code)
+	require.Equal(t, 400, mintReplayRequest(f, "42", strings.Repeat("a", 129), `{"name":"integration"}`).Code)
+	require.Zero(t, f.keys.creates)
+}
+
+func TestAdminCreateAPIKey_ConcurrentIdempotencyAndUserIsolation(t *testing.T) {
+	f := newMintFixture(t)
+	repo := &mintIdempotencyRepo{rows: make(map[string]*service.IdempotencyRecord)}
+	service.SetDefaultIdempotencyCoordinator(service.NewIdempotencyCoordinator(repo, service.DefaultIdempotencyConfig()))
+	t.Cleanup(func() { service.SetDefaultIdempotencyCoordinator(nil) })
+	var wg sync.WaitGroup
+	codes := make(chan int, 12)
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes <- mintReplayRequest(f, "42", "concurrent", `{"name":"integration","group_id":7}`).Code
+		}()
+	}
+	wg.Wait()
+	close(codes)
+	for code := range codes {
+		require.Contains(t, []int{200, 409}, code)
+	}
+	require.Equal(t, 1, f.keys.creates)
+	first := mintReplayRequest(f, "42", "concurrent", `{"name":"integration","group_id":7}`)
+	require.Equal(t, 200, first.Code)
+	f.users.target.ID = 43
+	other := mintReplayRequest(f, "43", "concurrent", `{"name":"integration","group_id":7}`)
+	require.Equal(t, 200, other.Code, other.Body.String())
+	require.Equal(t, 2, f.keys.creates)
+	require.NotEqual(t, f.keys.keys[0].Key, f.keys.keys[1].Key)
+	require.NotEqual(t, first.Body.String(), other.Body.String())
 }

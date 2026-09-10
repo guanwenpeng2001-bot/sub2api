@@ -1,6 +1,12 @@
 package admin
 
 import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"strconv"
 
 	"github.com/Wei-Shaw/sub2api/internal/handler/dto"
@@ -12,14 +18,16 @@ import (
 
 // AdminAPIKeyHandler handles admin API key management
 type AdminAPIKeyHandler struct {
-	adminService   service.AdminService
+	config        *config.Config
+	adminService  service.AdminService
 	apiKeyService *service.APIKeyService
 }
 
 // NewAdminAPIKeyHandler creates a new admin API key handler
-func NewAdminAPIKeyHandler(adminService service.AdminService, apiKeyService *service.APIKeyService) *AdminAPIKeyHandler {
+func NewAdminAPIKeyHandler(adminService service.AdminService, apiKeyService *service.APIKeyService, cfg *config.Config) *AdminAPIKeyHandler {
 	return &AdminAPIKeyHandler{
-		adminService:   adminService,
+		config:        cfg,
+		adminService:  adminService,
 		apiKeyService: apiKeyService,
 	}
 }
@@ -53,15 +61,104 @@ func (h *AdminAPIKeyHandler) CreateUserAPIKey(c *gin.Context) {
 		return
 	}
 
-	key, err := h.apiKeyService.Create(c.Request.Context(), userID, service.CreateAPIKeyRequest{
-		Name:    req.Name,
-		GroupID: req.GroupID,
-	})
+	idempotencyKey, err := service.NormalizeIdempotencyKey(c.GetHeader("Idempotency-Key"))
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
 	}
-	response.Success(c, dto.APIKeyFromService(key))
+	if idempotencyKey == "" {
+		key, createErr := h.apiKeyService.Create(c.Request.Context(), userID, service.CreateAPIKeyRequest{
+			Name: req.Name, GroupID: req.GroupID,
+		})
+		if createErr != nil {
+			response.ErrorFrom(c, createErr)
+			return
+		}
+		response.Success(c, dto.APIKeyFromService(key))
+		return
+	}
+	coordinator := service.DefaultIdempotencyCoordinator()
+	if coordinator == nil || h.config == nil || h.config.JWT.Secret == "" {
+		response.ErrorFrom(c, service.ErrIdempotencyStoreUnavail)
+		return
+	}
+	scope := "admin.user-api-key:" + adminActorScope(c) + ":" + strconv.FormatInt(userID, 10)
+	// The unique credential closes the create/MarkSucceeded crash window.
+	// Domain separation and the server secret keep public request keys non-secret.
+	mac := hmac.New(sha256.New, []byte(h.config.JWT.Secret))
+	mac.Write([]byte(scope + ":" + idempotencyKey))
+	credential := "sk-" + hex.EncodeToString(mac.Sum(nil))
+	find := func(ctx context.Context) (*service.APIKey, error) {
+		for page := 1; ; page++ {
+			keys, total, listErr := h.adminService.GetUserAPIKeys(ctx, userID, page, 100, "id", "asc")
+			if listErr != nil {
+				return nil, listErr
+			}
+			for _, key := range keys {
+				if key.UserID == userID && key.Key == credential {
+					return &key, nil
+				}
+			}
+			if int64(page*100) >= total || len(keys) == 0 {
+				return nil, nil
+			}
+		}
+	}
+	result, err := coordinator.Execute(c.Request.Context(), service.IdempotencyExecuteOptions{
+		Scope: scope, ActorScope: adminActorScope(c), Method: c.Request.Method,
+		Route: c.FullPath(), IdempotencyKey: idempotencyKey, Payload: req,
+		RequireKey: true, ReclaimExpiredProcessing: true, TTL: service.DefaultWriteIdempotencyTTL(),
+	}, func(ctx context.Context) (any, error) {
+		key, findErr := find(ctx)
+		if findErr != nil {
+			return nil, findErr
+		}
+		if key == nil {
+			key, findErr = h.apiKeyService.Create(ctx, userID, service.CreateAPIKeyRequest{
+				Name: req.Name, GroupID: req.GroupID, CustomKey: &credential,
+			})
+			if findErr != nil {
+				// A duplicate writer or a lost database response may have won.
+				recovered, recoveryErr := find(ctx)
+				if recoveryErr != nil || recovered == nil {
+					return nil, findErr
+				}
+				key = recovered
+			}
+		}
+		snapshot := dto.APIKeyFromService(key)
+		snapshot.Key = ""
+		return snapshot, nil
+	})
+	if err != nil {
+		if retryAfter := service.RetryAfterSecondsFromError(err); retryAfter > 0 {
+			c.Header("Retry-After", strconv.Itoa(retryAfter))
+		}
+		response.ErrorFrom(c, err)
+		return
+	}
+	// Restore the secret from its owning row, never from the redacted cache.
+	raw, err := json.Marshal(result.Data)
+	if err != nil {
+		response.ErrorFrom(c, service.ErrIdempotencyStoreUnavail)
+		return
+	}
+	var snapshot dto.APIKey
+	if err = json.Unmarshal(raw, &snapshot); err != nil {
+		response.ErrorFrom(c, service.ErrIdempotencyStoreUnavail)
+		return
+	}
+	key, err := h.apiKeyService.GetByID(c.Request.Context(), snapshot.ID)
+	if err != nil || key == nil || key.UserID != userID {
+		response.ErrorFrom(c, service.ErrIdempotencyStoreUnavail)
+		return
+	}
+	snapshot.Key = key.Key
+	if result.Replayed {
+		c.Header("X-Idempotency-Replayed", "true")
+	}
+	response.Success(c, &snapshot)
+
 }
 
 // AdminUpdateAPIKeyGroupRequest represents the request to update an API key.

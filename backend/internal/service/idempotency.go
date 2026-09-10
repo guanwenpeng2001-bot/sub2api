@@ -79,14 +79,16 @@ func DefaultIdempotencyConfig() IdempotencyConfig {
 }
 
 type IdempotencyExecuteOptions struct {
-	Scope          string
-	ActorScope     string
-	Method         string
-	Route          string
-	IdempotencyKey string
-	Payload        any
-	TTL            time.Duration
-	RequireKey     bool
+	// Only enable when the executor itself has a durable uniqueness constraint.
+	ReclaimExpiredProcessing bool
+	Scope                    string
+	ActorScope               string
+	Method                   string
+	Route                    string
+	IdempotencyKey           string
+	Payload                  any
+	TTL                      time.Duration
+	RequireKey               bool
 }
 
 type IdempotencyExecuteResult struct {
@@ -344,6 +346,16 @@ func (c *IdempotencyCoordinator) Execute(
 				logIdempotencyAudit(opts.Route, opts.Scope, keyHash, "succeeded->replayed", true, nil)
 				return &IdempotencyExecuteResult{Data: data, Replayed: true}, nil
 			case IdempotencyStatusProcessing:
+				if opts.ReclaimExpiredProcessing && existing.LockedUntil != nil && !existing.LockedUntil.After(now) {
+					taken, reclaimErr := c.repo.TryReclaim(ctx, existing.ID, IdempotencyStatusProcessing, now, lockedUntil, expiresAt)
+					if reclaimErr != nil {
+						return nil, ErrIdempotencyStoreUnavail.WithCause(reclaimErr)
+					}
+					if taken {
+						record.ID = existing.ID
+						break
+					}
+				}
 				recordIdempotencyConflict(opts.Route, opts.Scope, map[string]string{"reason": "in_progress"})
 				logIdempotencyAudit(opts.Route, opts.Scope, keyHash, "processing->conflict", false, nil)
 				return nil, c.conflictWithRetryAfter(ErrIdempotencyInProgress, existing.LockedUntil, now)
