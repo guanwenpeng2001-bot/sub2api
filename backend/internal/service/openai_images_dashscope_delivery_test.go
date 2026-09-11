@@ -50,7 +50,9 @@ func TestDashScopeOperationDeadlineCancelsNetwork(t *testing.T) {
 				}
 				if phase == "sync_body" || phase == "create_body" || phase == "poll_body" {
 					_, _ = io.WriteString(w, `{"output":`)
-					w.(http.Flusher).Flush()
+					if f, ok := w.(http.Flusher); ok {
+						f.Flush()
+					}
 				}
 				select {
 				case <-r.Context().Done():

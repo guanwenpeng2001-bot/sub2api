@@ -1980,7 +1980,7 @@ ORDER BY a.id`, group, platform)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	accounts := make([]service.Account, 0)
 	for rows.Next() {
 		var account service.Account

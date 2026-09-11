@@ -1303,14 +1303,6 @@ func writeModelsList(c *gin.Context, platform string, modelIDs []string) {
 	c.JSON(http.StatusOK, modelListPayload(c, models))
 }
 
-func writeAllowlistedModelsList(c *gin.Context, platform string, modelIDs []string) {
-	if platform == service.PlatformOpenAI {
-		writeOpenAIModelsList(c, modelIDs)
-		return
-	}
-	writeModelsList(c, platform, modelIDs)
-}
-
 type grokReasoningEffortOption struct {
 	Value   string `json:"value"`
 	Label   string `json:"label"`

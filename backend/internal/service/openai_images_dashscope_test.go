@@ -343,7 +343,9 @@ func TestOpenAIGatewayServiceForwardImages_DashScopeAsyncEditsRejected(t *testin
 	require.ErrorAs(t, err, &upErr)
 	require.Equal(t, http.StatusBadRequest, upErr.StatusCode)
 	require.Contains(t, upErr.Message, "not edits")
-	require.Empty(t, svc.httpUpstream.(*httpUpstreamRecorder).requests)
+	recorder, ok := svc.httpUpstream.(*httpUpstreamRecorder)
+	require.True(t, ok)
+	require.Empty(t, recorder.requests)
 }
 
 func TestDashScopeUsageToOpenAIMapPreservesImageCount(t *testing.T) {

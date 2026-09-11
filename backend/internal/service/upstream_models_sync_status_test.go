@@ -101,7 +101,9 @@ func TestUpstreamModelSyncStatesManualAndPeriodic(t *testing.T) {
 					require.NoError(t, err)
 				}
 				require.Equal(t, string(tc.status), extra[UpstreamModelSyncStatusExtraKey])
-				attempted, parseErr := time.Parse(time.RFC3339Nano, extra[UpstreamModelSyncAttemptExtraKey].(string))
+				attemptedRaw, ok := extra[UpstreamModelSyncAttemptExtraKey].(string)
+				require.True(t, ok)
+				attempted, parseErr := time.Parse(time.RFC3339Nano, attemptedRaw)
 				require.NoError(t, parseErr)
 				require.WithinDuration(t, time.Now(), attempted, time.Second)
 				require.Equal(t, "keep", extra["unrelated"])

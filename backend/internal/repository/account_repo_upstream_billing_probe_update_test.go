@@ -487,9 +487,9 @@ func updatedAccountRows(id int64, extra string) *sqlmock.Rows {
 func TestReplaceAccountEditableExtraProtectsCatalogKeysInDatabase(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	client := dbent.NewClient(dbent.Driver(entsql.OpenDB(dialect.Postgres, db)))
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	extra := map[string]any{"upstream_user_agent": "new-agent"}
 	for _, key := range service.UpstreamModelSyncManagedExtraKeys() {
 		extra[key] = "stale"

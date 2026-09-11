@@ -110,11 +110,11 @@ func (h *AdminAPIKeyHandler) CreateUserAPIKey(c *gin.Context) {
 				return nil, service.ErrIdempotencyStoreUnavail
 			}
 			derived := hmac.New(sha256.New, []byte(h.config.JWT.Secret))
-			derived.Write([]byte("sub2api/api-key-idempotency/hmac/v1"))
+			_, _ = derived.Write([]byte("sub2api/api-key-idempotency/hmac/v1"))
 			secret = string(derived.Sum(nil))
 		}
 		mac := hmac.New(sha256.New, []byte(secret))
-		mac.Write([]byte(scope + ":" + idempotencyKey))
+		_, _ = mac.Write([]byte(scope + ":" + idempotencyKey))
 		credential := "sk-" + hex.EncodeToString(mac.Sum(nil))
 		key, findErr := find(ctx, credential)
 		if findErr != nil {
