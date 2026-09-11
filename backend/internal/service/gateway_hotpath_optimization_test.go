@@ -165,6 +165,23 @@ func (s *stickyGatewayCacheHotpathStub) GetReasoningContent(_ context.Context, _
 	return "", ErrReasoningContentNotFound
 }
 
+func (s *modelsListAccountRepoStub) ListModelDiscoveryAccounts(ctx context.Context, groupID *int64, platform string) ([]Account, error) {
+	var accounts []Account
+	var err error
+	if groupID != nil {
+		accounts, err = s.ListSchedulableByGroupID(ctx, *groupID)
+	} else {
+		accounts, err = s.ListSchedulable(ctx)
+	}
+	filtered := make([]Account, 0, len(accounts))
+	for _, account := range accounts {
+		if platform == "" || account.Platform == platform {
+			filtered = append(filtered, account)
+		}
+	}
+	return filtered, err
+}
+
 func (s *modelsListAccountRepoStub) ListSchedulableByGroupID(ctx context.Context, groupID int64) ([]Account, error) {
 	s.listByGroupCalls.Add(1)
 	if s.err != nil {
@@ -492,7 +509,7 @@ func TestWithWindowCostPrefetch_BatchErrorFallbackSingleQuery(t *testing.T) {
 	require.Equal(t, int64(1), errCount)
 }
 
-func TestGetAvailableModels_UsesShortCacheAndSupportsInvalidation(t *testing.T) {
+func TestGetAvailableModels_UsesShortCache(t *testing.T) {
 	resetGatewayHotpathStatsForTest()
 
 	groupID := int64(9)
@@ -553,7 +570,7 @@ func TestGetAvailableModels_UsesShortCacheAndSupportsInvalidation(t *testing.T) 
 	require.Equal(t, []string{"claude-3-5-haiku", "claude-3-5-sonnet"}, models3)
 	require.Equal(t, int64(1), repo.listByGroupCalls.Load())
 
-	svc.InvalidateAvailableModelsCache(&groupID, PlatformAnthropic)
+	svc.modelsListCache.Flush()
 	models4 := svc.GetAvailableModels(context.Background(), &groupID, PlatformAnthropic)
 	require.Equal(t, []string{"claude-3-7-sonnet"}, models4)
 	require.Equal(t, int64(2), repo.listByGroupCalls.Load())
@@ -564,8 +581,8 @@ func TestGetAvailableModels_UsesShortCacheAndSupportsInvalidation(t *testing.T) 
 	require.Equal(t, int64(2), store)
 }
 
-// Scenario: 账号模型变更会失效所属平台缓存
-func TestResolveCompositeModelOwnershipUsesModelsCacheInvalidation(t *testing.T) {
+// Ownership remains cached until the cache entry expires or is cleared by the test.
+func TestResolveCompositeModelOwnershipUsesModelsCache(t *testing.T) {
 	groupID := int64(9)
 	repo := &modelsListAccountRepoStub{
 		byGroup: map[int64][]Account{
@@ -597,7 +614,7 @@ func TestResolveCompositeModelOwnershipUsesModelsCacheInvalidation(t *testing.T)
 	require.Equal(t, first, cached)
 	require.Equal(t, int64(1), repo.listByGroupCalls.Load())
 
-	svc.InvalidateAvailableModelsCache(&groupID, PlatformDeepseek)
+	svc.modelsListCache.Flush()
 	refreshed, err := svc.resolveCompositeModelOwnership(context.Background(), groupID, "company-model")
 	require.NoError(t, err)
 	require.Equal(t, CompositeModelOwnership{TargetPlatform: PlatformOpenAI, Matched: true}, refreshed)
@@ -801,51 +818,6 @@ func TestGatewayHotpathHelpers_CacheTTLAndStickyContext(t *testing.T) {
 		cost, ok := windowCostFromPrefetchContext(ctx, 9)
 		require.True(t, ok)
 		require.Equal(t, 12.34, cost)
-	})
-}
-
-func TestInvalidateAvailableModelsCache_ByDimensions(t *testing.T) {
-	svc := &GatewayService{
-		modelsListCache: gocache.New(time.Minute, time.Minute),
-	}
-	group9 := int64(9)
-	group10 := int64(10)
-	svc.modelsListCache.Set(modelsListCacheKey(&group9, PlatformAnthropic), []string{"a"}, time.Minute)
-	svc.modelsListCache.Set(modelsListCacheKey(&group9, PlatformGemini), []string{"b"}, time.Minute)
-	svc.modelsListCache.Set(modelsListCacheKey(&group10, PlatformAnthropic), []string{"c"}, time.Minute)
-	svc.modelsListCache.Set("invalid-key", []string{"d"}, time.Minute)
-
-	t.Run("invalidate_group_and_platform", func(t *testing.T) {
-		svc.InvalidateAvailableModelsCache(&group9, PlatformAnthropic)
-		_, found := svc.modelsListCache.Get(modelsListCacheKey(&group9, PlatformAnthropic))
-		require.False(t, found)
-		_, stillFound := svc.modelsListCache.Get(modelsListCacheKey(&group9, PlatformGemini))
-		require.True(t, stillFound)
-	})
-
-	t.Run("invalidate_group_only", func(t *testing.T) {
-		svc.InvalidateAvailableModelsCache(&group9, "")
-		_, foundA := svc.modelsListCache.Get(modelsListCacheKey(&group9, PlatformAnthropic))
-		_, foundB := svc.modelsListCache.Get(modelsListCacheKey(&group9, PlatformGemini))
-		require.False(t, foundA)
-		require.False(t, foundB)
-		_, foundOtherGroup := svc.modelsListCache.Get(modelsListCacheKey(&group10, PlatformAnthropic))
-		require.True(t, foundOtherGroup)
-	})
-
-	t.Run("invalidate_platform_only", func(t *testing.T) {
-		// 重建数据后仅按 platform 失效
-		svc.modelsListCache.Set(modelsListCacheKey(&group9, PlatformAnthropic), []string{"a"}, time.Minute)
-		svc.modelsListCache.Set(modelsListCacheKey(&group9, PlatformGemini), []string{"b"}, time.Minute)
-		svc.modelsListCache.Set(modelsListCacheKey(&group10, PlatformAnthropic), []string{"c"}, time.Minute)
-
-		svc.InvalidateAvailableModelsCache(nil, PlatformAnthropic)
-		_, found9Anthropic := svc.modelsListCache.Get(modelsListCacheKey(&group9, PlatformAnthropic))
-		_, found10Anthropic := svc.modelsListCache.Get(modelsListCacheKey(&group10, PlatformAnthropic))
-		_, found9Gemini := svc.modelsListCache.Get(modelsListCacheKey(&group9, PlatformGemini))
-		require.False(t, found9Anthropic)
-		require.False(t, found10Anthropic)
-		require.True(t, found9Gemini)
 	})
 }
 

@@ -594,8 +594,12 @@ func (s *OpenAIGatewayService) ForwardImages(
 	if parsed == nil {
 		return nil, fmt.Errorf("parsed images request is required")
 	}
-	if shouldForwardDashScopeImages(account, parsed, channelMappedModel) {
-		return s.forwardDashScopeImages(ctx, c, account, parsed, channelMappedModel)
+	route, err := resolveDashScopeImageRoute(account, parsed, channelMappedModel)
+	if err != nil {
+		return nil, err
+	}
+	if route != nil {
+		return s.forwardDashScopeImages(ctx, c, account, parsed, route)
 	}
 	switch account.Type {
 	case AccountTypeAPIKey:

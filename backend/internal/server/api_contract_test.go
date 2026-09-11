@@ -2960,3 +2960,7 @@ var (
 	_ service.UsageLogRepository         = (*stubUsageLogRepo)(nil)
 	_ service.SettingRepository          = (*stubSettingRepo)(nil)
 )
+
+func (s *stubAccountRepo) ListModelDiscoveryAccounts(context.Context, *int64, string) ([]service.Account, error) {
+	return nil, errors.New("not implemented")
+}

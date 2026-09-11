@@ -74,11 +74,35 @@ func TestIsDashScopeImageGenerationModel(t *testing.T) {
 }
 
 func TestNormalizeDashScopeNativeAPIBase(t *testing.T) {
-	require.Equal(t, "https://dashscope.aliyuncs.com/api/v1", normalizeDashScopeNativeAPIBase("https://dashscope.aliyuncs.com/compatible-mode/v1"))
-	require.Equal(t, "https://dashscope.aliyuncs.com/api/v1", normalizeDashScopeNativeAPIBase("https://dashscope.aliyuncs.com/api/v1"))
-	require.Equal(t, "https://dashscope-intl.aliyuncs.com/api/v1", normalizeDashScopeNativeAPIBase("https://dashscope-intl.aliyuncs.com/compatible-mode/v1/"))
-	require.Equal(t, "https://dashscope.aliyuncs.com/api/v1", normalizeDashScopeNativeAPIBase("https://dashscope.aliyuncs.com"))
-	require.Equal(t, dashScopeDefaultAPIBase, normalizeDashScopeNativeAPIBase(""))
+	for _, tc := range []struct{ raw, want string }{
+		{"", dashScopeDefaultAPIBase},
+		{"https://dashscope.aliyuncs.com/compatible-mode/v1", dashScopeDefaultAPIBase},
+		{"https://dashscope.aliyuncs.com/api/v1", dashScopeDefaultAPIBase},
+		{"https://dashscope.aliyuncs.com", dashScopeDefaultAPIBase},
+		{"https://dashscope-intl.aliyuncs.com/compatible-mode/v1/", "https://dashscope-intl.aliyuncs.com/api/v1"},
+		{"https://dashscope-us.aliyuncs.com/compatible-mode", "https://dashscope-us.aliyuncs.com/api/v1"},
+		{"https://relay.example/native/v2/", "https://relay.example/native/v2"},
+		{"https://relay.example", "https://relay.example"},
+		{"https://relay.example/v1", "https://relay.example/v1"},
+		{"https://relay.example/compatible-mode/v1", "https://relay.example/api/v1"},
+		{"https://relay.example/prefix/compatible-mode/v1", "https://relay.example/prefix/compatible-mode/v1"},
+		{"https://dashscope.aliyuncs.com/api/v1/custom", "https://dashscope.aliyuncs.com/api/v1/custom"},
+		{"https://dashscope.aliyuncs.com/custom", "https://dashscope.aliyuncs.com/custom"},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			got, err := normalizeDashScopeNativeAPIBase(tc.raw)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+	for _, raw := range []string{"not a URL", "://dashscope", "dashscope.aliyuncs.com", "https:///api/v1", "ftp://relay.example", "https://relay.example:bad", "https://user:secret@relay.example", "https://relay.example/%zz", "https://relay.example?token=secret", "https://relay.example/#fragment"} {
+		t.Run(raw, func(t *testing.T) {
+			got, err := normalizeDashScopeNativeAPIBase(raw)
+			require.ErrorContains(t, err, "base_url configuration")
+			require.Empty(t, got)
+			require.NotContains(t, err.Error(), "secret")
+		})
+	}
 }
 
 func TestMapDashScopeImageParameters(t *testing.T) {
@@ -112,19 +136,57 @@ func TestParseDashScopeImageUsage(t *testing.T) {
 }
 
 func TestIsDashScopeImageAccount(t *testing.T) {
-	require.True(t, isDashScopeImageAccount(newDashScopeImageAccount()))
-	require.True(t, isDashScopeImageAccount(&Account{
-		Type: AccountTypeAPIKey, Platform: "dashscope",
-		Credentials: map[string]any{"api_key": "sk-1"},
-	}))
-	require.False(t, isDashScopeImageAccount(&Account{
-		Type: AccountTypeAPIKey, Platform: PlatformOpenAI,
-		Credentials: map[string]any{"api_key": "sk-1", "base_url": "https://api.openai.com/v1"},
-	}))
-	require.False(t, isDashScopeImageAccount(&Account{
-		Type: AccountTypeOAuth, Platform: PlatformOpenAI,
-		Credentials: map[string]any{"base_url": "https://dashscope.aliyuncs.com/api/v1"},
-	}))
+	for _, host := range []string{"dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com", "dashscope-us.aliyuncs.com", "DASHSCOPE.ALIYUNCS.COM"} {
+		account := newDashScopeImageAccount()
+		account.Credentials["base_url"] = "https://" + host + "/compatible-mode/v1"
+		require.True(t, isDashScopeImageAccount(account), host)
+	}
+	for _, host := range []string{"dashscope.example.com", "dashscope.aliyuncs.com.evil.test", "api.openai.com", "relay.example/dashscope", "dashscope"} {
+		account := newDashScopeImageAccount()
+		account.Credentials["base_url"] = "https://" + host
+		require.False(t, isDashScopeImageAccount(account), host)
+		account.Credentials["protocol"] = "dashscope"
+		require.True(t, isDashScopeImageAccount(account), host)
+	}
+	for _, alias := range []string{"dashscope", "aliyun", "alibaba", "aliyun-bailian", "bailian"} {
+		account := &Account{Type: AccountTypeAPIKey, Platform: alias, Credentials: map[string]any{"provider": alias, "vendor": alias, "base_url": "https://relay.example"}}
+		require.False(t, isDashScopeImageAccount(account), alias)
+		account.Credentials["protocol"] = alias + "-compatible"
+		require.False(t, isDashScopeImageAccount(account), alias)
+	}
+	account := newDashScopeImageAccount()
+	account.Type = AccountTypeOAuth
+	require.False(t, isDashScopeImageAccount(account))
+	require.False(t, isDashScopeImageAccount(nil))
+}
+
+func TestForwardImages_DashScopeExplicitRelayAndInvalidConfiguration(t *testing.T) {
+	for _, tc := range []struct{ base, target string }{
+		{"https://relay.example/native/v2", "https://relay.example/native/v2"},
+		{"", dashScopeDefaultAPIBase},
+		{"not a URL", ""},
+		{"https://dashscope.aliyuncs.com:invalid", ""},
+	} {
+		t.Run(tc.base, func(t *testing.T) {
+			account := newDashScopeImageAccount()
+			account.Credentials["base_url"] = tc.base
+			account.Credentials["protocol"] = "dashscope"
+			upstream := &httpUpstreamRecorder{resp: dashScopeJSONResponse(http.StatusOK, `{"output":{"choices":[{"message":{"content":[{"image":"https://cdn.example.com/a.png"}]}}]}}`)}
+			svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+			body := []byte(`{"model":"qwen-image","prompt":"a red cup","response_format":"url"}`)
+			c, _ := newDashScopeImagesTestContext(t, body)
+			parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+			require.NoError(t, err)
+			_, err = svc.ForwardImages(context.Background(), c, account, body, parsed, "")
+			if tc.target == "" {
+				require.ErrorContains(t, err, "base_url configuration")
+				require.Nil(t, upstream.lastReq)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.target+dashScopeMultimodalGenerationPath, upstream.lastReq.URL.String())
+			}
+		})
+	}
 }
 
 func TestOpenAIGatewayServiceForwardImages_DashScopeSyncMultimodalGeneration(t *testing.T) {
@@ -358,15 +420,26 @@ func TestDashScopeUsageToOpenAIMapPreservesImageCount(t *testing.T) {
 	require.Equal(t, 20, details["image_tokens"])
 }
 
-func TestShouldForwardDashScopeImages(t *testing.T) {
+func TestResolveDashScopeImageRoute(t *testing.T) {
 	account := newDashScopeImageAccount()
-	require.True(t, shouldForwardDashScopeImages(account, &OpenAIImagesRequest{Model: "qwen-image"}, ""))
-	require.True(t, shouldForwardDashScopeImages(account, &OpenAIImagesRequest{Model: "gpt-image-2"}, "wanx-v1"))
-	require.False(t, shouldForwardDashScopeImages(account, &OpenAIImagesRequest{Model: "gpt-image-2"}, ""))
-	require.False(t, shouldForwardDashScopeImages(&Account{
-		Type: AccountTypeAPIKey, Platform: PlatformOpenAI,
-		Credentials: map[string]any{"base_url": "https://api.openai.com/v1"},
-	}, &OpenAIImagesRequest{Model: "qwen-image"}, ""))
+	account.Credentials["model_mapping"] = map[string]any{"gpt-image-1": "qwen-image-plus", "qwen-image-plus": "wanx-v1", "qwen-image": "gpt-image-2"}
+	route, err := resolveDashScopeImageRoute(account, &OpenAIImagesRequest{Model: "gpt-image-2"}, "gpt-image-1")
+	require.NoError(t, err)
+	require.Equal(t, "qwen-image-plus", route.model)
+	upstream := &httpUpstreamRecorder{resp: dashScopeJSONResponse(http.StatusOK, `{"output":{"choices":[{"message":{"content":[{"image":"https://cdn.example.com/a.png"}]}}]}}`)}
+	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+	body := []byte(`{"model":"gpt-image-2","prompt":"a cup","response_format":"url"}`)
+	c, _ := newDashScopeImagesTestContext(t, body)
+	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+	require.NoError(t, err)
+	_, err = svc.ForwardImages(context.Background(), c, account, body, parsed, "gpt-image-1")
+	require.NoError(t, err)
+	require.Equal(t, "qwen-image-plus", gjson.GetBytes(upstream.lastBody, "model").String())
+	for _, model := range []string{"gpt-image-2", "qwen-image"} {
+		route, err = resolveDashScopeImageRoute(account, &OpenAIImagesRequest{Model: model}, "")
+		require.NoError(t, err)
+		require.Nil(t, route)
+	}
 }
 
 func TestParseDashScopeImageValue_DataURI(t *testing.T) {

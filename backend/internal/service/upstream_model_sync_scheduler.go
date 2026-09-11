@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
-	"github.com/google/uuid"
 )
 
 // UpstreamModelSyncScheduler 周期性对所有 active 账号跑上游模型目录同步
@@ -21,6 +20,10 @@ import (
 // 姿态：best-effort。单账号失败只记日志，不影响其他账号；同步本身只刷新
 // accounts.extra 里的上游元数据快照，不动 model_mapping / 账号调度状态。
 //
+// 当前只使用进程内互斥。多副本或滚动更新可能重复扫描、覆盖元数据快照与同步状态；
+// 不涉及发 key、计费或模型映射。多副本部署应只让一个实例执行周期任务。
+// enabled 设置优先于环境变量；共享设置启用时，不能仅靠其他实例的环境变量关闭。
+//
 // 配置（环境变量）：
 //
 //	UPSTREAM_MODEL_SYNC_ENABLED                  "false" 关闭（默认关闭）
@@ -28,8 +31,6 @@ import (
 //	UPSTREAM_MODEL_SYNC_ACCOUNT_TIMEOUT_SECONDS  单账号超时秒数（默认 120）
 type UpstreamModelSyncScheduler struct {
 	accountLister      upstreamModelSyncAccountLister
-	lockCache          LeaderLockCache
-	lockTTL            time.Duration
 	accountTestService *AccountTestService
 
 	// syncAccount 是可替换的同步单元（默认走 AccountTestService），测试可注入假实现。
@@ -56,7 +57,6 @@ type upstreamModelSyncAccountLister interface {
 
 const (
 	upstreamModelSyncPageSize              = 100
-	upstreamModelSyncLeaderKey             = "upstream:model:sync:leader"
 	defaultUpstreamModelSyncIntervalHours  = 24
 	defaultUpstreamModelSyncAccountTimeout = 120 * time.Second
 )
@@ -135,23 +135,19 @@ func resolveUpstreamModelSyncConfig(values map[string]string, current upstreamMo
 func NewUpstreamModelSyncScheduler(
 	accountLister upstreamModelSyncAccountLister,
 	accountTestService *AccountTestService,
-	lockCache LeaderLockCache,
 ) *UpstreamModelSyncScheduler {
 	config, err := resolveUpstreamModelSyncConfig(nil, defaultUpstreamModelSyncConfig())
 	if err != nil {
 		slog.Error("invalid upstream model sync environment; scheduler disabled", "error", err)
 		config.enabled = false
 	}
-	svc := newUpstreamModelSyncScheduler(accountLister, accountTestService, config)
-	svc.lockCache = lockCache
-	return svc
+	return newUpstreamModelSyncScheduler(accountLister, accountTestService, config)
 }
 
 func newUpstreamModelSyncScheduler(accountLister upstreamModelSyncAccountLister, accountTestService *AccountTestService, config upstreamModelSyncConfig) *UpstreamModelSyncScheduler {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &UpstreamModelSyncScheduler{
 		accountLister:      accountLister,
-		lockTTL:            2 * time.Minute,
 		accountTestService: accountTestService,
 		parentCtx:          ctx,
 		parentCancel:       cancel,
@@ -176,7 +172,6 @@ func ProvideUpstreamModelSyncScheduler(
 	accountRepo AccountRepository,
 	accountTestService *AccountTestService,
 	settings *SettingService,
-	lockCache LeaderLockCache,
 ) *UpstreamModelSyncScheduler {
 	lister, ok := accountRepo.(upstreamModelSyncAccountLister)
 	if !ok {
@@ -184,7 +179,6 @@ func ProvideUpstreamModelSyncScheduler(
 	}
 	svc := newUpstreamModelSyncScheduler(lister, accountTestService, defaultUpstreamModelSyncConfig())
 	svc.settings = settings
-	svc.lockCache = lockCache
 	if settings != nil {
 		// These existing listeners are notified after every successful settings write.
 		svc.unsubscribe = settings.SubscribeChannelMonitorRuntime(func() {
@@ -361,15 +355,6 @@ func (s *UpstreamModelSyncScheduler) RunOnce(ctx context.Context) error {
 		return err
 	}
 
-	leaseCtx, release, acquired, err := s.acquireCycleLock(ctx)
-	if err != nil {
-		return err
-	}
-	if !acquired {
-		return nil
-	}
-	defer release()
-	ctx = leaseCtx
 	failures, total := 0, 0
 	var afterID int64
 	for {
@@ -428,50 +413,4 @@ func (s *UpstreamModelSyncScheduler) RunOnce(ctx context.Context) error {
 		return fmt.Errorf("upstream model sync: %d/%d accounts failed", failures, total)
 	}
 	return nil
-}
-
-// acquireCycleLock requires coordination even on a single instance: old and new
-// processes may overlap during a restart. An unavailable lock fails closed.
-func (s *UpstreamModelSyncScheduler) acquireCycleLock(ctx context.Context) (context.Context, func(), bool, error) {
-	cache, ok := s.lockCache.(RenewableLeaderLockCache)
-	if !ok {
-		return ctx, nil, false, errors.New("model sync requires a renewable leader lock")
-	}
-	owner := uuid.NewString()
-	lockCtx, lockCancel := context.WithTimeout(ctx, 2*time.Second)
-	acquired, err := cache.TryAcquireLeaderLock(lockCtx, upstreamModelSyncLeaderKey, owner, s.lockTTL)
-	lockCancel()
-	if err != nil || !acquired {
-		return ctx, nil, false, err
-	}
-	leaseCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(s.lockTTL / 3)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-leaseCtx.Done():
-				return
-			case <-ticker.C:
-				renewCtx, renewCancel := context.WithTimeout(leaseCtx, min(2*time.Second, s.lockTTL/3))
-				renewed, renewErr := cache.RenewLeaderLock(renewCtx, upstreamModelSyncLeaderKey, owner, s.lockTTL)
-				renewCancel()
-				if renewErr != nil || !renewed {
-					slog.Warn("upstream model sync lost leader lock", "error", renewErr)
-					cancel()
-					return
-				}
-			}
-		}
-	}()
-	release := func() {
-		cancel()
-		<-done
-		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer releaseCancel()
-		_ = cache.ReleaseLeaderLock(releaseCtx, upstreamModelSyncLeaderKey, owner)
-	}
-	return leaseCtx, release, true, nil
 }

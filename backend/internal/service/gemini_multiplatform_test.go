@@ -1007,3 +1007,7 @@ func TestGeminiMessagesCompatService_isModelSupportedByAccount(t *testing.T) {
 		})
 	}
 }
+
+func (m *mockAccountRepoForGemini) ListModelDiscoveryAccounts(context.Context, *int64, string) ([]Account, error) {
+	panic("unexpected ListModelDiscoveryAccounts call")
+}

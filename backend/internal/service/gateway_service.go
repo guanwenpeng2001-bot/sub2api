@@ -1375,29 +1375,14 @@ func (s *GatewayService) DoGrokNativeResponsesJSON(ctx context.Context, account 
 	return respBytes, nil
 }
 
-// listModelDiscoveryAccounts shares the lean source across platform listings
-// and composite discovery. Legacy repositories remain usable by embedded tests.
+// listModelDiscoveryAccounts uses scheduler metadata or the repository projection.
 func (s *GatewayService) listModelDiscoveryAccounts(ctx context.Context, groupID *int64, platform string) ([]Account, error) {
-	var accounts []Account
-	var err error
-
 	if s.schedulerSnapshot != nil && platform != "" && groupID != nil && *groupID > 0 {
-		// Read model_mapping from scheduler metadata without hydrating account rows.
-		// Force the platform bucket so discovery does not add mixed-platform models.
-		accounts, _, err = s.schedulerSnapshot.ListSchedulableAccounts(ctx, groupID, platform, true)
-	} else if projection, ok := s.accountRepo.(interface {
-		ListModelDiscoveryAccounts(context.Context, *int64, string) ([]Account, error)
-	}); ok {
-		// Unscoped discovery and deployments without snapshots still avoid
-		// full credentials and proxy/group hydration.
-		accounts, err = projection.ListModelDiscoveryAccounts(ctx, groupID, platform)
-	} else if groupID != nil {
-		accounts, err = s.accountRepo.ListSchedulableByGroupID(ctx, *groupID)
-	} else {
-		accounts, err = s.accountRepo.ListSchedulable(ctx)
+		// Force the platform bucket to avoid adding mixed-platform models.
+		accounts, _, err := s.schedulerSnapshot.ListSchedulableAccounts(ctx, groupID, platform, true)
+		return accounts, err
 	}
-
-	return accounts, err
+	return s.accountRepo.ListModelDiscoveryAccounts(ctx, groupID, platform)
 }
 
 // AvailableModelCatalog distinguishes discovery from static suggestions. Static and
@@ -1604,64 +1589,6 @@ func (s *GatewayService) GetSchedulablePlatforms(ctx context.Context, groupID *i
 		s.modelsListCache.Set(cacheKey, names, s.modelsListCacheTTL)
 	}
 	return platforms
-}
-
-func (s *GatewayService) InvalidateAvailableModelsCache(groupID *int64, platform string) {
-	if s == nil || s.modelsListCache == nil {
-		return
-	}
-	s.invalidateCompositeModelOwnershipCache(groupID)
-	s.invalidateGroupModelCache(groupID, "models-platforms|")
-
-	normalizedPlatform := strings.TrimSpace(platform)
-	// 完整匹配时精准失效；否则按维度批量失效。
-	if groupID != nil && normalizedPlatform != "" {
-		s.modelsListCache.Delete(modelsListCacheKey(groupID, normalizedPlatform))
-		return
-	}
-
-	targetGroup := derefGroupID(groupID)
-	for key := range s.modelsListCache.Items() {
-		parts := strings.SplitN(key, "|", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		groupPart, parseErr := strconv.ParseInt(parts[0], 10, 64)
-		if parseErr != nil {
-			continue
-		}
-		if groupID != nil && groupPart != targetGroup {
-			continue
-		}
-		if normalizedPlatform != "" && parts[1] != normalizedPlatform {
-			continue
-		}
-		s.modelsListCache.Delete(key)
-	}
-}
-
-func (s *GatewayService) invalidateCompositeModelOwnershipCache(groupID *int64) {
-	s.invalidateGroupModelCache(groupID, compositeModelOwnershipCachePrefix)
-}
-
-func (s *GatewayService) invalidateGroupModelCache(groupID *int64, prefix string) {
-	for key := range s.modelsListCache.Items() {
-		if !strings.HasPrefix(key, prefix) {
-			continue
-		}
-		if groupID == nil {
-			s.modelsListCache.Delete(key)
-			continue
-		}
-		parts := strings.SplitN(strings.TrimPrefix(key, prefix), "|", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		cachedGroupID, err := strconv.ParseInt(parts[0], 10, 64)
-		if err == nil && cachedGroupID == *groupID {
-			s.modelsListCache.Delete(key)
-		}
-	}
 }
 
 const debugGatewayBodyDefaultFilename = "gateway_debug.log"

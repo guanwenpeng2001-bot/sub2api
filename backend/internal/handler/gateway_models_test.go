@@ -61,6 +61,26 @@ type gatewayReasoningEffortOptionForTest struct {
 	Default bool   `json:"default"`
 }
 
+func (s *gatewayModelsAccountRepoStub) ListModelDiscoveryAccounts(ctx context.Context, groupID *int64, platform string) ([]service.Account, error) {
+	var accounts []service.Account
+	var err error
+	if groupID != nil {
+		accounts, err = s.ListSchedulableByGroupID(ctx, *groupID)
+	} else {
+		for _, group := range s.byGroup {
+			accounts = append(accounts, group...)
+		}
+		err = s.err
+	}
+	filtered := make([]service.Account, 0, len(accounts))
+	for _, account := range accounts {
+		if platform == "" || account.Platform == platform {
+			filtered = append(filtered, account)
+		}
+	}
+	return filtered, err
+}
+
 func (s *gatewayModelsAccountRepoStub) ListSchedulableByGroupID(ctx context.Context, groupID int64) ([]service.Account, error) {
 	if s.err != nil {
 		return nil, s.err
@@ -1545,4 +1565,105 @@ func TestGatewayCodexModels_CompositeCNOnlyDoesNotInventDefaults(t *testing.T) {
 	var got codexModelsResponseForTest
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
 	require.Empty(t, got.Models)
+}
+
+// Every visible ID must be retrievable, and errors/empty catalogs must never
+// become static suggestions on the individual-model endpoint.
+func TestGatewayModelEndpointsShareEffectiveCatalog(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, platform := range []string{service.PlatformAnthropic, service.PlatformOpenAI, service.PlatformGemini, service.PlatformAntigravity, service.PlatformGrok, service.PlatformKimi, service.PlatformZhipu, service.PlatformDeepseek, service.PlatformMiniMax, service.PlatformComposite} {
+		for _, scenario := range []string{"mapped", "unmapped", "empty", "query_failed"} {
+			for _, allowlist := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/allowlist=%t", platform, scenario, allowlist), func(t *testing.T) {
+					accountPlatform := platform
+					if platform == service.PlatformComposite {
+						accountPlatform = service.PlatformOpenAI
+					}
+					repo := &gatewayModelsAccountRepoStub{byGroup: map[int64][]service.Account{}}
+					account := service.Account{ID: 1, Platform: accountPlatform}
+					if scenario == "mapped" {
+						account.Credentials = map[string]any{"model_mapping": map[string]any{"visible-alias": "upstream", "hidden-alias": "other"}}
+					}
+					if scenario != "empty" {
+						repo.byGroup[1] = []service.Account{account}
+					}
+					if scenario == "query_failed" {
+						repo.err = errors.New("database unavailable")
+					}
+					key := &service.APIKey{Group: &service.Group{ID: 1, Platform: platform, ModelAllowlist: service.GroupModelAllowlist{Enabled: allowlist, Models: []string{"visible-*", "claude-*", "gpt-*", "gemini-*", "grok-*"}}}}
+					h := newGatewayModelsHandlerForTest(repo)
+					call := func(model string) *httptest.ResponseRecorder {
+						rec := httptest.NewRecorder()
+						c, _ := gin.CreateTestContext(rec)
+						c.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+						c.Set(string(middleware2.ContextKeyAPIKey), key)
+						if model == "" {
+							h.Models(c)
+						} else {
+							c.Params = gin.Params{{Key: "model", Value: model}}
+							h.RetrieveModel(c)
+						}
+						return rec
+					}
+					list := call("")
+					if scenario == "query_failed" {
+						retrieved := call("gpt-5.6-sol")
+						require.Equal(t, http.StatusServiceUnavailable, list.Code)
+						require.Equal(t, list.Code, retrieved.Code)
+						require.JSONEq(t, list.Body.String(), retrieved.Body.String())
+						return
+					}
+					require.Equal(t, http.StatusOK, list.Code)
+					var catalog gatewayModelsResponseForTest
+					require.NoError(t, json.Unmarshal(list.Body.Bytes(), &catalog))
+					for _, model := range catalog.Data {
+						retrieved := call(model.ID)
+						require.Equal(t, http.StatusOK, retrieved.Code, model.ID)
+						require.Equal(t, list.Header().Get("X-Model-Catalog-Source"), retrieved.Header().Get("X-Model-Catalog-Source"))
+						var got gatewayModelItemForTest
+						require.NoError(t, json.Unmarshal(retrieved.Body.Bytes(), &got))
+						require.Equal(t, model.ID, got.ID)
+					}
+					if scenario == "empty" {
+						require.Empty(t, catalog.Data)
+						for _, model := range defaultModelIDsForPlatform(platform) {
+							require.Equal(t, http.StatusNotFound, call(model).Code, model)
+						}
+					}
+					if allowlist {
+						require.Equal(t, http.StatusNotFound, call("hidden-alias").Code)
+					}
+					require.Equal(t, http.StatusNotFound, call("unknown-model").Code)
+				})
+			}
+		}
+	}
+}
+
+func TestGatewayModelEndpointsShareForcedPlatform(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := newGatewayModelsHandlerForTest(&gatewayModelsAccountRepoStub{byGroup: map[int64][]service.Account{1: {
+		{Platform: service.PlatformOpenAI, Credentials: map[string]any{"model_mapping": map[string]any{"openai-alias": "gpt-5"}}},
+		{Platform: service.PlatformGemini, Credentials: map[string]any{"model_mapping": map[string]any{"gemini-alias": "gemini-2.5-pro"}}},
+	}}})
+	for _, model := range []string{"", "openai-alias", "gemini-alias"} {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{Group: &service.Group{ID: 1, Platform: service.PlatformComposite}})
+		c.Set(string(middleware2.ContextKeyForcePlatform), service.PlatformOpenAI)
+		if model == "" {
+			h.Models(c)
+		} else {
+			c.Params = gin.Params{{Key: "model", Value: model}}
+			h.RetrieveModel(c)
+		}
+		if model == "gemini-alias" {
+			require.Equal(t, http.StatusNotFound, rec.Code)
+			continue
+		}
+		require.Equal(t, http.StatusOK, rec.Code)
+		require.Contains(t, rec.Body.String(), "openai-alias")
+		require.NotContains(t, rec.Body.String(), "gemini-alias")
+	}
 }

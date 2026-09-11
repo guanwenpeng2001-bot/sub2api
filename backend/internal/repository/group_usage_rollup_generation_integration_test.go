@@ -8,8 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Wei-Shaw/sub2api/migrations"
-	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
 
@@ -176,12 +174,6 @@ func newGroupUsageGenerationConnections(t *testing.T, ctx context.Context, parti
 	schema := createGroupUsageRollupTriggerTestSchema(t, ctx, partitioned)
 	tx := beginGroupUsageRollupTriggerTestTx(t, ctx, schema)
 	defer func() { _ = tx.Rollback() }()
-	for _, file := range []string{"238_group_usage_rollup_insert_cas.sql", "239_group_usage_rollup_dirty_generations.sql"} {
-		body, err := migrations.FS.ReadFile(file)
-		require.NoError(t, err)
-		_, err = tx.ExecContext(ctx, string(body))
-		require.NoError(t, err)
-	}
 	_, err := tx.ExecContext(ctx, `
         INSERT INTO groups VALUES (10), (20);
         INSERT INTO users VALUES (1);
@@ -191,18 +183,7 @@ func newGroupUsageGenerationConnections(t *testing.T, ctx context.Context, parti
     `)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
-	connect := func() *sql.Conn {
-		conn, err := integrationDB.Conn(ctx)
-		require.NoError(t, err)
-		t.Cleanup(func() {
-			_, _ = conn.ExecContext(context.Background(), "RESET search_path")
-			_ = conn.Close()
-		})
-		_, err = conn.ExecContext(ctx, "SET search_path TO "+pq.QuoteIdentifier(schema))
-		require.NoError(t, err)
-		return conn
-	}
-	return connect(), connect()
+	return connectGroupUsageRollupTestSchema(t, ctx, schema), connectGroupUsageRollupTestSchema(t, ctx, schema)
 }
 
 func assertGroupUsageGenerationSummary(t *testing.T, ctx context.Context, conn *sql.Conn, today time.Time) {

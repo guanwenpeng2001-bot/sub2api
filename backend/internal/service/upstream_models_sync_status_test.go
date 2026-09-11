@@ -83,7 +83,7 @@ func TestUpstreamModelSyncStatesManualAndPeriodic(t *testing.T) {
 				svc := &AccountTestService{accountRepo: repo, httpUpstream: upstream, cfg: upstreamModelSyncTestConfig()}
 				var err error
 				if periodic {
-					scheduler := NewUpstreamModelSyncScheduler(&upstreamModelSyncListerStub{accounts: []Account{*account}}, svc, &modelSyncLockStub{})
+					scheduler := NewUpstreamModelSyncScheduler(&upstreamModelSyncListerStub{accounts: []Account{*account}}, svc)
 					defer scheduler.Stop()
 					err = scheduler.RunOnce(context.Background())
 				} else {

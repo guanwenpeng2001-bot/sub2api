@@ -28,15 +28,7 @@ func (h *GatewayHandler) RetrieveModel(c *gin.Context) {
 	}
 
 	apiKey, _ := middleware2.GetAPIKeyFromContext(c)
-	var groupID *int64
-	var platform string
-	if apiKey != nil && apiKey.Group != nil {
-		groupID = &apiKey.Group.ID
-		platform = apiKey.Group.Platform
-	}
-	if forcedPlatform, ok := middleware2.GetForcePlatformFromContext(c); ok && strings.TrimSpace(forcedPlatform) != "" {
-		platform = forcedPlatform
-	}
+	platform := modelCatalogPlatform(c, apiKey)
 
 	if platform == service.PlatformOpenAI && apiKey != nil && apiKey.Group != nil &&
 		apiKey.Group.Platform == service.PlatformOpenAI && apiKey.Group.CodexModelsManifestConfig.Enabled {
@@ -44,36 +36,11 @@ func (h *GatewayHandler) RetrieveModel(c *gin.Context) {
 		return
 	}
 
-	var modelIDs []string
-	if platform == service.PlatformComposite {
-		availableModels := h.compositeAvailableModels(c.Request.Context(), groupID)
-		if apiKey != nil && apiKey.Group != nil && apiKey.Group.ModelAllowlistEnabled() {
-			source := availableModels
-			if len(source) == 0 {
-				source = defaultModelIDsForPlatform(service.PlatformComposite)
-			}
-			modelIDs = apiKey.Group.ModelAllowlist.FilterForListing(source)
-		} else if len(availableModels) > 0 {
-			modelIDs = availableModels
-		} else {
-			modelIDs = defaultModelIDsForPlatform(service.PlatformComposite)
-		}
-		writeRetrievedModel(c, platform, modelIDs, requested)
+	catalog, ok := h.effectiveModelCatalog(c, apiKey, platform)
+	if !ok {
 		return
 	}
-
-	availableModels := h.gatewayService.GetAvailableModels(c.Request.Context(), groupID, platform)
-	if apiKey != nil && apiKey.Group != nil && apiKey.Group.ModelAllowlistEnabled() {
-		source := modelListingSource(platform, availableModels, defaultModelIDsForPlatform(platform))
-		modelIDs = apiKey.Group.ModelAllowlist.FilterForListing(source)
-		writeRetrievedModel(c, platform, modelIDs, requested)
-		return
-	}
-	if len(availableModels) > 0 {
-		writeRetrievedModel(c, platform, availableModels, requested)
-		return
-	}
-	writeRetrievedModel(c, platform, defaultModelIDsForPlatform(platform), requested)
+	writeRetrievedModel(c, platform, catalog.Models, requested)
 }
 
 func (h *GatewayHandler) retrievePinnedOpenAIModel(c *gin.Context, group *service.Group, requested string) {

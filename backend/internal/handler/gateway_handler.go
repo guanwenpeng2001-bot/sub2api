@@ -1123,16 +1123,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 func (h *GatewayHandler) Models(c *gin.Context) {
 	apiKey, _ := middleware2.GetAPIKeyFromContext(c)
 
-	var groupID *int64
-	var platform string
-
-	if apiKey != nil && apiKey.Group != nil {
-		groupID = &apiKey.Group.ID
-		platform = apiKey.Group.Platform
-	}
-	if forcedPlatform, ok := middleware2.GetForcePlatformFromContext(c); ok && strings.TrimSpace(forcedPlatform) != "" {
-		platform = forcedPlatform
-	}
+	platform := modelCatalogPlatform(c, apiKey)
 
 	if platform == service.PlatformOpenAI && apiKey != nil && apiKey.Group != nil &&
 		apiKey.Group.Platform == service.PlatformOpenAI && apiKey.Group.CodexModelsManifestConfig.Enabled {
@@ -1140,6 +1131,32 @@ func (h *GatewayHandler) Models(c *gin.Context) {
 		return
 	}
 
+	catalog, ok := h.effectiveModelCatalog(c, apiKey, platform)
+	if !ok {
+		return
+	}
+	logger.FromContext(c.Request.Context()).Info("gateway.models.list", zap.String("platform", platform), zap.String("source", catalog.Source), zap.Int("model_count", len(catalog.Models)))
+	writeModelsList(c, platform, catalog.Models)
+}
+
+func modelCatalogPlatform(c *gin.Context, apiKey *service.APIKey) string {
+	var platform string
+	if apiKey != nil && apiKey.Group != nil {
+		platform = apiKey.Group.Platform
+	}
+	if forced, ok := middleware2.GetForcePlatformFromContext(c); ok && strings.TrimSpace(forced) != "" {
+		platform = forced
+	}
+	return platform
+}
+
+// effectiveModelCatalog resolves suggestions, authoritative emptiness, allowlists
+// and discovery failures identically for listing and individual model retrieval.
+func (h *GatewayHandler) effectiveModelCatalog(c *gin.Context, apiKey *service.APIKey, platform string) (service.AvailableModelCatalog, bool) {
+	var groupID *int64
+	if apiKey != nil && apiKey.Group != nil {
+		groupID = &apiKey.Group.ID
+	}
 	var catalog service.AvailableModelCatalog
 	var err error
 	if platform == service.PlatformComposite {
@@ -1154,7 +1171,7 @@ func (h *GatewayHandler) Models(c *gin.Context) {
 		c.Header("X-Model-Catalog-Source", "query_failed")
 		logger.FromContext(c.Request.Context()).Warn("gateway.models.discovery_failed", zap.String("platform", platform), zap.String("source", "query_failed"), zap.Error(err))
 		c.JSON(http.StatusServiceUnavailable, gin.H{"source": "query_failed", "authoritative": false, "error": gin.H{"type": "api_error", "message": "Model catalog query failed"}})
-		return
+		return service.AvailableModelCatalog{}, false
 	}
 	if apiKey != nil && apiKey.Group != nil && apiKey.Group.ModelAllowlistEnabled() {
 		if platform == service.PlatformAnthropic && len(catalog.Models) > 0 && catalog.Source == "account_mapping" {
@@ -1168,8 +1185,7 @@ func (h *GatewayHandler) Models(c *gin.Context) {
 	}
 	c.Set("model_catalog_source", catalog.Source)
 	c.Header("X-Model-Catalog-Source", catalog.Source)
-	logger.FromContext(c.Request.Context()).Info("gateway.models.list", zap.String("platform", platform), zap.String("source", catalog.Source), zap.Int("model_count", len(catalog.Models)))
-	writeModelsList(c, platform, catalog.Models)
+	return catalog, true
 }
 
 // CodexModels returns the effective group model list using the manifest shape

@@ -83,6 +83,9 @@ type AccountRepository interface {
 	AutoPauseExpiredAccounts(ctx context.Context, now time.Time) (int64, error)
 	BindGroups(ctx context.Context, accountID int64, groupIDs []int64) error
 
+	// ListModelDiscoveryAccounts returns only scheduling and model-mapping metadata,
+	// filtered by group (nil means all groups) and platform (empty means all).
+	ListModelDiscoveryAccounts(ctx context.Context, groupID *int64, platform string) ([]Account, error)
 	ListSchedulable(ctx context.Context) ([]Account, error)
 	ListSchedulableByGroupID(ctx context.Context, groupID int64) ([]Account, error)
 	ListSchedulableByPlatform(ctx context.Context, platform string) ([]Account, error)

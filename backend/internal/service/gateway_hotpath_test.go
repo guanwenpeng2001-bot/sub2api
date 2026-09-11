@@ -205,7 +205,7 @@ func TestFixQUnscopedAndCompositeDiscoveryUseProjection(t *testing.T) {
 	require.Contains(t, svc.GetSchedulablePlatforms(context.Background(), &id), PlatformAnthropic)
 	require.Equal(t, 2, repo.calls)
 	repo.accounts = []Account{{Platform: PlatformGemini}}
-	svc.InvalidateAvailableModelsCache(&id, PlatformAnthropic)
+	svc.modelsListCache.Flush()
 	require.Contains(t, svc.GetSchedulablePlatforms(context.Background(), &id), PlatformGemini)
 	require.Equal(t, 3, repo.calls)
 }
@@ -240,7 +240,7 @@ func TestAvailableModelCatalog_CacheSourcesAndRecovery(t *testing.T) {
 			}
 			require.Equal(t, 2, repo.calls)
 			repo.accounts = []Account{{ID: 1, Platform: platform}}
-			svc.InvalidateAvailableModelsCache(&groupID, platform)
+			svc.modelsListCache.Flush()
 			for i := 0; i < 2; i++ {
 				catalog, err = svc.GetAvailableModelCatalog(context.Background(), &groupID, platform)
 				require.NoError(t, err)
@@ -252,7 +252,7 @@ func TestAvailableModelCatalog_CacheSourcesAndRecovery(t *testing.T) {
 			}
 			require.Equal(t, 3, repo.calls)
 			repo.accounts[0].Credentials = map[string]any{"model_mapping": map[string]any{"alias": "upstream"}}
-			svc.InvalidateAvailableModelsCache(&groupID, platform)
+			svc.modelsListCache.Flush()
 			catalog, err = svc.GetAvailableModelCatalog(context.Background(), &groupID, platform)
 			require.NoError(t, err)
 			require.Equal(t, "account_mapping", catalog.Source)

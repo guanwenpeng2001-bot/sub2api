@@ -3589,3 +3589,7 @@ func TestGatewayService_SelectAccountForModelWithPlatform_RoutedOpenAIGroup(t *t
 	require.NotNil(t, acc)
 	require.Equal(t, int64(2), acc.ID, "routed account must win over the higher-priority unrouted one")
 }
+
+func (m *mockAccountRepoForPlatform) ListModelDiscoveryAccounts(context.Context, *int64, string) ([]Account, error) {
+	panic("unexpected ListModelDiscoveryAccounts call")
+}

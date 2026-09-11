@@ -40,42 +40,52 @@ var (
 	dashScopeImageTaskTimeout      = 180 * time.Second
 )
 
-func shouldForwardDashScopeImages(account *Account, parsed *OpenAIImagesRequest, channelMappedModel string) bool {
+type dashScopeImageRoute struct {
+	requestModel string
+	model        string
+	baseURL      string
+}
+
+func resolveDashScopeImageRoute(account *Account, parsed *OpenAIImagesRequest, channelMappedModel string) (*dashScopeImageRoute, error) {
 	if !isDashScopeImageAccount(account) {
-		return false
+		return nil, nil
 	}
-	requestModel := ""
-	if parsed != nil {
-		requestModel = strings.TrimSpace(parsed.Model)
-	}
+	requestModel := strings.TrimSpace(parsed.Model)
 	if mapped := strings.TrimSpace(channelMappedModel); mapped != "" {
 		requestModel = mapped
 	}
-	upstreamModel := requestModel
-	if account != nil {
-		upstreamModel = account.GetMappedModel(requestModel)
+	upstreamModel := account.GetMappedModel(requestModel)
+	if !isDashScopeImageGenerationModel(upstreamModel) {
+		return nil, nil
 	}
-	return isDashScopeImageGenerationModel(requestModel) || isDashScopeImageGenerationModel(upstreamModel)
+	if err := validateOpenAIImagesModel(requestModel); err != nil {
+		return nil, err
+	}
+	if err := validateOpenAIImagesModel(upstreamModel); err != nil {
+		return nil, err
+	}
+	baseURL, err := normalizeDashScopeNativeAPIBase(dashScopeConfiguredBaseURL(account))
+	if err != nil {
+		return nil, err
+	}
+	return &dashScopeImageRoute{requestModel: requestModel, model: upstreamModel, baseURL: baseURL}, nil
+}
+
+func dashScopeConfiguredBaseURL(account *Account) string {
+	// Explicit protocol with no base uses the DashScope default, not OpenAI's.
+	if strings.TrimSpace(account.GetCredential("base_url")) == "" && strings.EqualFold(strings.TrimSpace(account.GetCredential("protocol")), "dashscope") {
+		return ""
+	}
+	if base := account.GetOpenAIBaseURL(); base != "" {
+		return base
+	}
+	return account.GetCredential("base_url")
 }
 
 func isDashScopeImageAccount(account *Account) bool {
-	if account == nil || account.Type != AccountTypeAPIKey {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(account.Platform)) {
-	case "dashscope", "aliyun", "alibaba", "aliyun-bailian", "bailian":
-		return true
-	}
-	if isDashScopeHostURL(account.GetOpenAIBaseURL()) || isDashScopeHostURL(account.GetCredential("base_url")) {
-		return true
-	}
-	for _, key := range []string{"provider", "vendor", "protocol"} {
-		value := strings.ToLower(strings.TrimSpace(account.GetCredential(key)))
-		if strings.Contains(value, "dashscope") || value == "aliyun" || value == "alibaba" {
-			return true
-		}
-	}
-	return false
+	return account != nil && account.Type == AccountTypeAPIKey &&
+		(strings.EqualFold(strings.TrimSpace(account.GetCredential("protocol")), "dashscope") ||
+			isDashScopeHostURL(dashScopeConfiguredBaseURL(account)))
 }
 
 func isDashScopeSyncImageModel(model string) bool {
@@ -109,19 +119,15 @@ func mapDashScopeModelImageSize(model, size string) string {
 }
 
 func isDashScopeHostURL(raw string) bool {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") {
 		return false
 	}
-	parsed, err := url.Parse(raw)
-	if err != nil {
-		return strings.Contains(strings.ToLower(raw), "dashscope")
+	switch strings.ToLower(parsed.Hostname()) {
+	case "dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com", "dashscope-us.aliyuncs.com":
+		return true
 	}
-	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
-	if host == "" {
-		host = strings.ToLower(strings.TrimSpace(parsed.Host))
-	}
-	return strings.Contains(host, "dashscope")
+	return false
 }
 
 func dashScopeImageAPIKey(account *Account) string {
@@ -134,44 +140,26 @@ func dashScopeImageAPIKey(account *Account) string {
 	return strings.TrimSpace(account.GetCredential("api_key"))
 }
 
-func dashScopeNativeAPIBase(account *Account) string {
-	raw := ""
-	if account != nil {
-		raw = strings.TrimSpace(account.GetOpenAIBaseURL())
-		if raw == "" {
-			raw = strings.TrimSpace(account.GetCredential("base_url"))
-		}
-	}
-	return normalizeDashScopeNativeAPIBase(raw)
-}
-
-func normalizeDashScopeNativeAPIBase(raw string) string {
+func normalizeDashScopeNativeAPIBase(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return dashScopeDefaultAPIBase
+		return dashScopeDefaultAPIBase, nil
 	}
 	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return dashScopeDefaultAPIBase
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		// Do not include the configured URL: it may contain credentials.
+		return "", fmt.Errorf("invalid DashScope base_url configuration: expected an absolute HTTP(S) base URL without credentials, query or fragment")
 	}
-	path := strings.TrimSuffix(parsed.Path, "/")
-	lower := strings.ToLower(path)
-	switch {
-	case strings.Contains(lower, "/compatible-mode"):
-		path = "/api/v1"
-	case strings.HasPrefix(lower, "/api/v1"):
-		path = "/api/v1"
-	case path == "" || path == "/v1":
-		path = "/api/v1"
-	default:
-		if strings.Contains(strings.ToLower(parsed.Host), "dashscope") {
-			path = "/api/v1"
+	path := strings.TrimRight(parsed.EscapedPath(), "/")
+	switch path {
+	case "/compatible-mode", "/compatible-mode/v1":
+		parsed.Path, parsed.RawPath = "/api/v1", ""
+	case "":
+		if isDashScopeHostURL(raw) {
+			parsed.Path = "/api/v1"
 		}
 	}
-	parsed.Path = path
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	return strings.TrimRight(parsed.String(), "/")
+	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
 func joinDashScopeAPIURL(base, path string) string {
@@ -267,7 +255,7 @@ func (s *OpenAIGatewayService) forwardDashScopeImages(
 	c *gin.Context,
 	account *Account,
 	parsed *OpenAIImagesRequest,
-	channelMappedModel string,
+	route *dashScopeImageRoute,
 ) (*OpenAIForwardResult, error) {
 	startTime := time.Now()
 	if parsed.Stream || parsed.MaskUpload != nil || strings.TrimSpace(parsed.MaskImageURL) != "" {
@@ -284,20 +272,7 @@ func (s *OpenAIGatewayService) forwardDashScopeImages(
 		writeOpenAIImagesUpstreamErrorResponse(c, upErr)
 		return nil, upErr
 	}
-	requestModel := strings.TrimSpace(parsed.Model)
-	if mapped := strings.TrimSpace(channelMappedModel); mapped != "" {
-		requestModel = mapped
-	}
-	if err := validateOpenAIImagesModel(requestModel); err != nil {
-		return nil, err
-	}
-	upstreamModel := account.GetMappedModel(requestModel)
-	if err := validateOpenAIImagesModel(upstreamModel); err != nil {
-		return nil, err
-	}
-	if !isDashScopeImageGenerationModel(upstreamModel) {
-		return nil, fmt.Errorf("images endpoint requires an image model, got %q", upstreamModel)
-	}
+	upstreamModel := route.model
 	SetOpsUpstreamModel(c, upstreamModel)
 	if strings.EqualFold(upstreamModel, "z-image-turbo") && (parsed.IsEdits() || parsed.N > 1) {
 		upErr := &OpenAIImagesUpstreamError{
@@ -322,8 +297,7 @@ func (s *OpenAIGatewayService) forwardDashScopeImages(
 	if token == "" {
 		return nil, fmt.Errorf("api_key not found in credentials")
 	}
-	nativeBase := dashScopeNativeAPIBase(account)
-	validatedBase, err := s.validateUpstreamBaseURL(nativeBase)
+	validatedBase, err := s.validateUpstreamBaseURL(route.baseURL)
 	if err != nil {
 		return nil, err
 	}
@@ -381,7 +355,7 @@ func (s *OpenAIGatewayService) forwardDashScopeImages(
 		RequestID:        requestID,
 		UpstreamHeaders:  respHeader,
 		Usage:            usage,
-		Model:            requestModel,
+		Model:            route.requestModel,
 		UpstreamModel:    upstreamModel,
 		UpstreamEndpoint: upstreamURL,
 		ResponseHeaders:  respHeader.Clone(),

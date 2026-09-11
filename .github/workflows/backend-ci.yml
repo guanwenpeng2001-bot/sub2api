@@ -23,6 +23,10 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    # Keep local httptest requests out of runner proxies.
+    env:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -34,6 +38,12 @@ jobs:
       - name: Verify Go version
         run: |
           go version | grep -q 'go1.27.0'
+      - name: Production build
+        working-directory: backend
+        run: go build ./...
+      - name: Go vet
+        working-directory: backend
+        run: go vet ./...
       - name: Unit tests
         working-directory: backend
         run: make test-unit
