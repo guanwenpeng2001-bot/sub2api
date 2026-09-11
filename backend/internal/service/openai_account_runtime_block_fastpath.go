@@ -125,7 +125,7 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 		return false
 	}
 
-	if isOpenAIImageRateLimitError(statusCode, responseBody) {
+	if isImageCapabilityRateLimitError(stateCtx, statusCode, responseBody, canonicalModel...) {
 		if s != nil && s.rateLimitService != nil {
 			_ = s.rateLimitService.HandleOpenAIImageRateLimit(stateCtx, account, statusCode, headers, responseBody)
 		}

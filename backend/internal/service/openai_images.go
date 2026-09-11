@@ -470,6 +470,29 @@ func isOpenAIImageGenerationModel(model string) bool {
 	return IsGPTImageGenerationModel(model) || isGrokImageGenerationModel(model)
 }
 
+func isDashScopeImageGenerationModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return false
+	}
+	if strings.HasPrefix(model, "qwen-image") || strings.HasPrefix(model, "wanx") {
+		return true
+	}
+	if !strings.HasPrefix(model, "wan") {
+		return false
+	}
+	rest := model[len("wan"):]
+	if rest == "" {
+		return false
+	}
+	switch rest[0] {
+	case '-', '.', 'x':
+		return true
+	default:
+		return rest[0] >= '0' && rest[0] <= '9'
+	}
+}
+
 // IsGPTImageGenerationModel identifies the GPT native image-generation model family.
 func IsGPTImageGenerationModel(model string) bool {
 	model = strings.ToLower(strings.TrimSpace(model))
@@ -485,7 +508,7 @@ func isGrokImageGenerationModel(model string) bool {
 
 func validateOpenAIImagesModel(model string) error {
 	model = strings.TrimSpace(model)
-	if isOpenAIImageGenerationModel(model) {
+	if isOpenAIImageGenerationModel(model) || isDashScopeImageGenerationModel(model) {
 		return nil
 	}
 	if model == "" {
@@ -570,6 +593,9 @@ func (s *OpenAIGatewayService) ForwardImages(
 ) (*OpenAIForwardResult, error) {
 	if parsed == nil {
 		return nil, fmt.Errorf("parsed images request is required")
+	}
+	if shouldForwardDashScopeImages(account, parsed, channelMappedModel) {
+		return s.forwardDashScopeImages(ctx, c, account, parsed, channelMappedModel)
 	}
 	switch account.Type {
 	case AccountTypeAPIKey:

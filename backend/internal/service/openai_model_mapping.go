@@ -70,6 +70,9 @@ func isOpenAIOAuthServableModel(requestedModel string) bool {
 	if model == "" {
 		return true // 空模型交由上层必填校验处理
 	}
+	if isDashScopeImageGenerationModel(requestedModel) || isDashScopeImageGenerationModel(model) {
+		return false
+	}
 	// Kimi Code 官方 bare model ID：无厂商前缀，prefix 黑名单挡不住。
 	if model == "k3" || model == "k3-256k" {
 		return false

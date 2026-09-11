@@ -342,6 +342,44 @@ func TestOpenAIGatewayServiceParseOpenAIImagesRequest_RejectsNonImageModel(t *te
 	require.ErrorContains(t, err, `images endpoint requires an image model, got "gpt-5.4"`)
 }
 
+func TestOpenAIGatewayServiceParseOpenAIImagesRequest_AllowsDashScopeImageModels(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, model := range []string{"qwen-image", "qwen-image-plus", "qwen-image-edit", "wanx-v1", "wanx2.1-t2i-turbo", "wan2.2-t2i-flash"} {
+		t.Run(model, func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"model":%q,"prompt":"draw a cat","response_format":"url"}`, model))
+			req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = req
+
+			svc := &OpenAIGatewayService{}
+			parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+			require.NoError(t, err)
+			require.NotNil(t, parsed)
+			require.Equal(t, model, parsed.Model)
+			require.True(t, isDashScopeImageGenerationModel(parsed.Model))
+		})
+	}
+}
+
+func TestOpenAIGatewayServiceParseOpenAIImagesRequest_RejectsDashScopeTextModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{"model":"qwen-plus","prompt":"draw a cat"}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = req
+
+	svc := &OpenAIGatewayService{}
+	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+	require.Nil(t, parsed)
+	require.ErrorContains(t, err, `images endpoint requires an image model, got "qwen-plus"`)
+}
+
 func TestOpenAIGatewayServiceParseOpenAIImagesRequest_AllowsGrokImageModels(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

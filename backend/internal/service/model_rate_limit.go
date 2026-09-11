@@ -103,6 +103,9 @@ func openAIImageGenerationRateLimitApplies(ctx context.Context, requestedModel, 
 	if isOpenAIImageGenerationModel(requestedModel) || isOpenAIImageGenerationModel(modelKey) {
 		return true
 	}
+	if isDashScopeImageGenerationModel(requestedModel) || isDashScopeImageGenerationModel(modelKey) {
+		return true
+	}
 	return OpenAIImageGenerationIntentFromContext(ctx)
 }
 

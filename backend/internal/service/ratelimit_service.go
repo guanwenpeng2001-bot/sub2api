@@ -2305,14 +2305,14 @@ func (s *RateLimitService) HandleOpenAIImageRateLimit(ctx context.Context, accou
 	if s == nil || account == nil || s.accountRepo == nil {
 		return false
 	}
-	if account.Platform != PlatformOpenAI {
+	if account.Platform != PlatformOpenAI && !isDashScopeImageAccount(account) {
 		return false
 	}
 	if !account.ShouldHandleErrorCode(statusCode) {
 		slog.Info("openai_image_rate_limit_skipped_by_error_code_policy", "account_id", account.ID, "status_code", statusCode)
 		return false
 	}
-	if !isOpenAIImageRateLimitError(statusCode, responseBody) {
+	if !isOpenAIImageRateLimitError(statusCode, responseBody) && !isDashScopeThrottlingPayload(responseBody) {
 		return false
 	}
 
@@ -2508,6 +2508,10 @@ func (s *RateLimitService) HandleUpstreamModelNotFound(ctx context.Context, acco
 		cooldown, reason = s.modelNotFoundCooldown(ctx), upstreamModelNotFoundReason
 	case isOpenAIOAuthAccount(account) && isOpenAICodexPlanGatedModelError(statusCode, responseBody):
 		cooldown, reason = s.planGatedCooldown(ctx), upstreamCodexPlanGatedModelReason
+	case isDashScopeImageAccount(account) && isDashScopeUnsupportedModelError(statusCode, responseBody):
+		// Per-model cooldown only: the account may still serve other DashScope
+		// models. Same isolation as Codex plan-gated / 404 model-not-found.
+		cooldown, reason = s.modelNotFoundCooldown(ctx), upstreamModelNotFoundReason
 	default:
 		return false
 	}

@@ -127,6 +127,9 @@ func TestIsOpenAIOAuthServableModel(t *testing.T) {
 	require.True(t, isOpenAIOAuthServableModel("DeepThink-x"))  // 非黑名单前缀，保持允许
 	require.False(t, isOpenAIOAuthServableModel("DeepSeek-V4")) // 大小写不敏感
 	require.False(t, isOpenAIOAuthServableModel("qwen3-235b-thinking"))
+	require.False(t, isOpenAIOAuthServableModel("qwen-image-plus"))
+	require.False(t, isOpenAIOAuthServableModel("wanx-v1"))
+	require.False(t, isOpenAIOAuthServableModel("wan2.2-t2i-flash"))
 	require.True(t, isOpenAIOAuthServableModel("deepseekcoder")) // 无连字符 → 非黑名单前缀，保持允许
 	require.False(t, isOpenAIOAuthServableModel("k3"))
 	require.False(t, isOpenAIOAuthServableModel("k3-256k"))
