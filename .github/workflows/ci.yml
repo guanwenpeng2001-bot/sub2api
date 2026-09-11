@@ -1,0 +1,178 @@
+# Fork safety net: compile, lint, unit tests, migration filenames.
+# No secrets, no deploy, no image push.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-unit:
+    name: backend-unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    # Aliyun captcha verifier tests talk to httptest. An HTTP_PROXY (common on
+    # self-hosted runners) intercepts 127.0.0.1 and returns 502. GitHub-hosted
+    # runners have no proxy; this keeps the suite hermetic anyway.
+    env:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache: true
+          cache-dependency-path: backend/go.sum
+      - name: go build
+        run: go build ./...
+      - name: go vet
+        run: go vet ./...
+      - name: go test (unit tag)
+        # Makefile test-unit: -tags=unit includes //go:build unit files plus
+        # untagged tests. integration / e2e / embed tests stay excluded.
+        # -short skips TLS fingerprint live probes (google.com / tls.peet.ws)
+        # which also require TLSFINGERPRINT_NETWORK_TESTS=1. Aliyun captcha
+        # tests use httptest, not the real Aliyun endpoint.
+        run: go test -tags=unit -short -count=1 ./internal/...
+
+  backend-test:
+    name: backend-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache: true
+          cache-dependency-path: backend/go.sum
+      - name: go test (default tags, short)
+        # Remaining ./internal/... tests without -tags=unit (so //go:build unit
+        # files are excluded). -short skips testing.Short() network probes.
+        # Prompt-audit Postgres/Redis cases skip unless their env DSN is set.
+        # integration / e2e / embed tests are not selected (need Docker / live
+        # services / -tags=embed).
+        run: go test -short -count=1 ./internal/...
+
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Install
+        # Lockfile is pnpm-lock.yaml (no package-lock.json). This is the
+        # repo equivalent of npm ci.
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        # package.json "lint" passes --fix; CI uses lint:check (same eslint,
+        # no working-tree writes).
+        run: pnpm run lint:check
+      - name: Build
+        run: pnpm run build
+
+  migrations:
+    name: migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check migration filenames
+        # Runner keys by filename and applies in lexicographic order
+        # (internal/repository/migrations_runner.go). This tree already has
+        # parallel files sharing a numeric prefix (e.g. 028_*.sql) and gaps
+        # (017, 021–023, 025, 146, …); those are historical and allowed.
+        # Fail on unparsable names, non-3-digit padding (breaks sort order),
+        # and numeric prefixes going backwards in filename order.
+        run: |
+          python3 - <<'PY'
+          import re
+          import sys
+          from collections import defaultdict
+          from pathlib import Path
+
+          root = Path("backend/migrations")
+          if not root.is_dir():
+              print("missing backend/migrations", file=sys.stderr)
+              sys.exit(1)
+
+          pat = re.compile(r"^(\d{3})([a-z]?)_.+\.sql$")
+          files = sorted(p.name for p in root.iterdir() if p.suffix == ".sql")
+          if not files:
+              print("no SQL migration files", file=sys.stderr)
+              sys.exit(1)
+
+          errors = []
+          parsed = []
+          for name in files:
+              m = pat.match(name)
+              if not m:
+                  errors.append(f"invalid name: {name}")
+                  continue
+              parsed.append((name, int(m.group(1)), m.group(2)))
+
+          prev_num = -1
+          for name, num, _letter in parsed:
+              if num < prev_num:
+                  errors.append(
+                      f"numeric prefix went backwards in sort order: {name} ({num} < {prev_num})"
+                  )
+              prev_num = num
+
+          if errors:
+              print("migration check failed:", file=sys.stderr)
+              for err in errors:
+                  print(f"  {err}", file=sys.stderr)
+              sys.exit(1)
+
+          by_key = defaultdict(list)
+          for name, num, letter in parsed:
+              by_key[(num, letter)].append(name)
+          shared = sum(1 for names in by_key.values() if len(names) > 1)
+          nums = sorted({num for _name, num, _letter in parsed})
+          num_set = set(nums)
+          gaps = [n for n in range(nums[0], nums[-1] + 1) if n not in num_set]
+          print(
+              f"ok: {len(parsed)} SQL files, prefixes {nums[0]:03d}..{nums[-1]:03d}, "
+              f"{shared} shared numeric prefixes (historical), {len(gaps)} gaps (historical)"
+          )
+          PY
