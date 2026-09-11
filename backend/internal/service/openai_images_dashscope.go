@@ -36,12 +36,6 @@ const (
 var (
 	dashScopeImageTaskPollInterval = 2 * time.Second
 	dashScopeImageTaskTimeout      = 180 * time.Second
-	dashScopeImageSleep            = func(d time.Duration) {
-		if d <= 0 {
-			return
-		}
-		time.Sleep(d)
-	}
 )
 
 func shouldForwardDashScopeImages(account *Account, parsed *OpenAIImagesRequest, channelMappedModel string) bool {
@@ -225,9 +219,6 @@ func mapDashScopeImageParameters(model string, parsed *OpenAIImagesRequest) dash
 	if parsed.PartialImages != nil {
 		params.Ignored = append(params.Ignored, "partial_images")
 	}
-	if parsed.Stream {
-		params.Ignored = append(params.Ignored, "stream")
-	}
 	return params
 }
 
@@ -251,6 +242,20 @@ func (s *OpenAIGatewayService) forwardDashScopeImages(
 	channelMappedModel string,
 ) (*OpenAIForwardResult, error) {
 	startTime := time.Now()
+	if parsed.Stream || parsed.MaskUpload != nil || strings.TrimSpace(parsed.MaskImageURL) != "" {
+		option := "mask"
+		if parsed.Stream {
+			option = "stream=true"
+		}
+		upErr := &OpenAIImagesUpstreamError{
+			StatusCode: http.StatusBadRequest,
+			ErrorType:  "invalid_request_error",
+			Code:       "unsupported_parameter",
+			Message:    "DashScope images do not support " + option,
+		}
+		writeOpenAIImagesUpstreamErrorResponse(c, upErr)
+		return nil, upErr
+	}
 	requestModel := strings.TrimSpace(parsed.Model)
 	if mapped := strings.TrimSpace(channelMappedModel); mapped != "" {
 		requestModel = mapped
@@ -285,7 +290,10 @@ func (s *OpenAIGatewayService) forwardDashScopeImages(
 		return nil, err
 	}
 
-	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+	// Keep collecting usage after a downstream disconnect, but bound the entire
+	// operation (generation, polling, body reads and downloads) from its start.
+	// HTTPUpstream passes this context to net/http.Client.Do and its Transport.
+	upstreamCtx, releaseUpstreamCtx := context.WithTimeout(context.WithoutCancel(ctx), dashScopeImageTaskTimeout)
 	defer releaseUpstreamCtx()
 
 	var (
@@ -311,45 +319,56 @@ func (s *OpenAIGatewayService) forwardDashScopeImages(
 		images, usageBody, requestID, respHeader, upstreamURL, err = s.generateDashScopeImageAsync(upstreamCtx, c, account, parsed, upstreamModel, validatedBase, token)
 	}
 	if err != nil {
+		if upstreamCtx.Err() != nil {
+			upErr := &OpenAIImagesUpstreamError{
+				StatusCode: http.StatusGatewayTimeout,
+				ErrorType:  "timeout",
+				Code:       "image_generation_timeout",
+				Message:    "DashScope image operation exceeded its time limit",
+			}
+			writeOpenAIImagesUpstreamErrorResponse(c, upErr)
+			return nil, upErr
+		}
 		return nil, err
 	}
 
-	openaiBody, usage, imageCount, err := s.buildDashScopeOpenAIImagesResponse(upstreamCtx, account, parsed, images, usageBody)
-	if err != nil {
-		upErr := &OpenAIImagesUpstreamError{
-			StatusCode:        http.StatusBadGateway,
-			ErrorType:         "upstream_error",
-			Message:           sanitizeUpstreamErrorMessage(err.Error()),
-			UpstreamRequestID: requestID,
-		}
-		writeOpenAIImagesUpstreamErrorResponse(c, upErr)
-		return nil, upErr
-	}
+	openaiBody, usage, imageCount, deliveryErr := s.buildDashScopeOpenAIImagesResponse(upstreamCtx, account, parsed, images, usageBody)
 	if respHeader == nil {
 		respHeader = make(http.Header)
 	}
 	if requestID != "" && respHeader.Get("x-request-id") == "" {
 		respHeader.Set("x-request-id", requestID)
 	}
-	responseheaders.WriteFilteredHeaders(c.Writer.Header(), respHeader, s.responseHeaderFilter)
-	c.Data(http.StatusOK, "application/json", openaiBody)
-	if imageCount <= 0 {
-		imageCount = parsed.N
-	}
-	return &OpenAIForwardResult{
+	result := &OpenAIForwardResult{
 		RequestID:        requestID,
 		UpstreamHeaders:  respHeader,
 		Usage:            usage,
 		Model:            requestModel,
 		UpstreamModel:    upstreamModel,
 		UpstreamEndpoint: upstreamURL,
-		Stream:           false,
 		ResponseHeaders:  respHeader.Clone(),
 		Duration:         time.Since(startTime),
 		ImageCount:       imageCount,
 		ImageSize:        parsed.SizeTier,
 		ImageInputSize:   parsed.Size,
-	}, nil
+		ClientDisconnect: ctx.Err() != nil,
+	}
+	if deliveryErr != nil {
+		upErr := &OpenAIImagesUpstreamError{
+			StatusCode:        http.StatusBadGateway,
+			ErrorType:         "upstream_error",
+			Code:              "image_download_failed",
+			Message:           sanitizeUpstreamErrorMessage(deliveryErr.Error()),
+			UpstreamRequestID: requestID,
+		}
+		setOpsUpstreamError(c, upErr.StatusCode, upErr.Message, upErr.Code)
+		writeOpenAIImagesUpstreamErrorResponse(c, upErr)
+		// The handler records usage for nonempty image results even on error.
+		return result, upErr
+	}
+	responseheaders.WriteFilteredHeaders(c.Writer.Header(), respHeader, s.responseHeaderFilter)
+	c.Data(http.StatusOK, "application/json", openaiBody)
+	return result, nil
 }
 
 type dashScopeImageResult struct {
@@ -377,7 +396,7 @@ func (s *OpenAIGatewayService) generateDashScopeImageSync(
 		return nil, nil, "", nil, targetURL, err
 	}
 	if resp.StatusCode >= 400 {
-		_, err = s.handleOpenAIImagesErrorResponse(ctx, resp, c, account, model)
+		_, err = s.handleDashScopeImagesErrorResponse(ctx, resp, c, account, model)
 		return nil, nil, "", nil, targetURL, err
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -417,7 +436,7 @@ func (s *OpenAIGatewayService) generateDashScopeImageAsync(
 		return nil, nil, "", nil, createURL, err
 	}
 	if resp.StatusCode >= 400 {
-		_, err = s.handleOpenAIImagesErrorResponse(ctx, resp, c, account, model)
+		_, err = s.handleDashScopeImagesErrorResponse(ctx, resp, c, account, model)
 		return nil, nil, "", nil, createURL, err
 	}
 	createBody, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
@@ -437,7 +456,6 @@ func (s *OpenAIGatewayService) generateDashScopeImageAsync(
 		return nil, nil, "", nil, createURL, upErr
 	}
 	taskURL := joinDashScopeAPIURL(base, dashScopeTaskPathPrefix+url.PathEscape(taskID))
-	deadline := time.Now().Add(dashScopeImageTaskTimeout)
 	var lastHeader http.Header
 	for {
 		if err := ctx.Err(); err != nil {
@@ -449,7 +467,7 @@ func (s *OpenAIGatewayService) generateDashScopeImageAsync(
 		}
 		lastHeader = pollResp.Header.Clone()
 		if pollResp.StatusCode >= 400 {
-			_, err = s.handleOpenAIImagesErrorResponse(ctx, pollResp, c, account, model)
+			_, err = s.handleDashScopeImagesErrorResponse(ctx, pollResp, c, account, model)
 			return nil, nil, "", nil, taskURL, err
 		}
 		pollBody, readErr := ReadUpstreamResponseBody(pollResp.Body, s.cfg, c, openAITooLargeError)
@@ -487,23 +505,19 @@ func (s *OpenAIGatewayService) generateDashScopeImageAsync(
 			}
 			if isDashScopeUnsupportedModelError(status, pollBody) || isDashScopeThrottlingPayload(pollBody) {
 				fake := &http.Response{StatusCode: status, Header: lastHeader, Body: io.NopCloser(bytes.NewReader(pollBody))}
-				_, err = s.handleOpenAIImagesErrorResponse(ctx, fake, c, account, model)
+				_, err = s.handleDashScopeImagesErrorResponse(ctx, fake, c, account, model)
 				return nil, nil, "", nil, taskURL, err
 			}
 			writeOpenAIImagesUpstreamErrorResponse(c, upErr)
 			return nil, nil, "", nil, taskURL, upErr
 		}
-		if time.Now().After(deadline) {
-			upErr := &OpenAIImagesUpstreamError{
-				StatusCode:        http.StatusGatewayTimeout,
-				ErrorType:         "timeout",
-				Message:           "dashscope task timed out after 180s",
-				UpstreamRequestID: dashScopeRequestID(lastHeader, pollBody),
-			}
-			writeOpenAIImagesUpstreamErrorResponse(c, upErr)
-			return nil, nil, "", nil, taskURL, upErr
+		timer := time.NewTimer(dashScopeImageTaskPollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, nil, "", nil, taskURL, ctx.Err()
+		case <-timer.C:
 		}
-		dashScopeImageSleep(dashScopeImageTaskPollInterval)
 	}
 }
 
@@ -692,7 +706,8 @@ func parseDashScopeImageValue(raw string) dashScopeImageResult {
 		if decoded := decodeDashScopeImageBase64(raw); decoded != "" {
 			return dashScopeImageResult{B64: decoded}
 		}
-		return dashScopeImageResult{}
+		// Preserve a generated result even when its base64 cannot be delivered.
+		return dashScopeImageResult{B64: raw}
 	}
 	if !strings.Contains(raw, "://") && isLikelyRawBase64(raw) {
 		if decoded := decodeDashScopeImageBase64(raw); decoded != "" {
@@ -734,15 +749,27 @@ func (s *OpenAIGatewayService) buildDashScopeOpenAIImagesResponse(
 	upstreamBody []byte,
 ) ([]byte, OpenAIUsage, int, error) {
 	wantB64 := parsed != nil && strings.EqualFold(strings.TrimSpace(parsed.ResponseFormat), "b64_json")
+	// Capture all upstream consumption before any delivery operation can fail.
+	usage, usageOK := parseDashScopeImageUsage(upstreamBody)
+	imageCount := len(images)
+	if usageCount := dashScopeUsageImageCount(upstreamBody); usageCount > imageCount {
+		imageCount = usageCount
+	}
 	data := make([]map[string]any, 0, len(images))
 	for _, image := range images {
 		item := map[string]any{}
 		b64 := strings.TrimSpace(image.B64)
+		if b64 != "" {
+			b64 = decodeDashScopeImageBase64(b64)
+			if b64 == "" {
+				return nil, usage, imageCount, fmt.Errorf("decode dashscope image: invalid base64")
+			}
+		}
 		imageURL := strings.TrimSpace(image.URL)
 		if wantB64 && b64 == "" && imageURL != "" {
 			encoded, err := s.fetchOpenAIImageURLBase64(ctx, account, imageURL)
 			if err != nil {
-				return nil, OpenAIUsage{}, 0, fmt.Errorf("download dashscope image: %w", err)
+				return nil, usage, imageCount, fmt.Errorf("download dashscope image: %w", err)
 			}
 			b64 = encoded
 		}
@@ -758,12 +785,7 @@ func (s *OpenAIGatewayService) buildDashScopeOpenAIImagesResponse(
 		data = append(data, item)
 	}
 	if len(data) == 0 {
-		return nil, OpenAIUsage{}, 0, fmt.Errorf("dashscope returned no image")
-	}
-	usage, usageOK := parseDashScopeImageUsage(upstreamBody)
-	imageCount := len(data)
-	if usageCount := dashScopeUsageImageCount(upstreamBody); usageCount > imageCount {
-		imageCount = usageCount
+		return nil, usage, imageCount, fmt.Errorf("dashscope returned no image")
 	}
 	resp := map[string]any{
 		"created": time.Now().Unix(),
@@ -774,7 +796,7 @@ func (s *OpenAIGatewayService) buildDashScopeOpenAIImagesResponse(
 	}
 	body, err := json.Marshal(resp)
 	if err != nil {
-		return nil, OpenAIUsage{}, 0, err
+		return nil, usage, imageCount, err
 	}
 	if !usageOK {
 		if extracted, ok := extractOpenAIUsageFromJSONBytes(body); ok {
@@ -880,6 +902,9 @@ func isDashScopeThrottlingPayload(body []byte) bool {
 		return false
 	}
 	code := strings.ToLower(dashScopeErrorCode(body))
+	if strings.Contains(code, "invalidparameter") {
+		return false
+	}
 	if strings.Contains(code, "throttl") || strings.Contains(code, "ratequota") || strings.Contains(code, "limitrequests") {
 		return true
 	}
@@ -897,6 +922,10 @@ func isDashScopeUnsupportedModelError(statusCode int, body []byte) bool {
 		return false
 	}
 	code := strings.ToLower(dashScopeErrorCode(body))
+	// InvalidParameter is a request failure, including a bad model parameter.
+	if strings.Contains(code, "invalidparameter") {
+		return false
+	}
 	msg := strings.ToLower(strings.TrimSpace(extractUpstreamErrorMessage(body)))
 	if msg == "" {
 		msg = strings.ToLower(string(body))
@@ -909,12 +938,6 @@ func isDashScopeUnsupportedModelError(statusCode int, body []byte) bool {
 		strings.Contains(code, "modelnotexist"),
 		strings.Contains(code, "invalidmodel"),
 		strings.Contains(code, "model.notfound"):
-		return true
-	case strings.Contains(code, "invalidparameter") && (strings.Contains(msg, "model not exist") ||
-		strings.Contains(msg, "does not exist") ||
-		strings.Contains(msg, "not accessible") ||
-		strings.Contains(msg, "not support") ||
-		strings.Contains(msg, "unknown model")):
 		return true
 	case strings.Contains(msg, "model not exist"),
 		strings.Contains(msg, "model does not exist"),
@@ -944,4 +967,35 @@ func isImageCapabilityRateLimitError(ctx context.Context, statusCode int, body [
 		}
 	}
 	return false
+}
+
+// DashScope request/configuration failures must not mutate account scheduling.
+// Only quota/throttling and overload responses enter the shared cooldown path.
+func (s *OpenAIGatewayService) handleDashScopeImagesErrorResponse(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, model string) (*OpenAIForwardResult, error) {
+	body := s.readUpstreamErrorBody(resp)
+	if resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	code := strings.ToLower(dashScopeErrorCode(body))
+	parameterError := strings.Contains(code, "invalidparameter")
+	coolable := !parameterError && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable || isDashScopeThrottlingPayload(body))
+	if coolable {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		return s.handleOpenAIImagesErrorResponse(ctx, resp, c, account, model)
+	}
+	upErr := openAIImagesUpstreamErrorFromHTTP(resp.StatusCode, resp.Header, body)
+	upErr.Code = dashScopeErrorCode(body)
+	upErr.UpstreamRequestID = dashScopeRequestID(resp.Header, body)
+	if message := strings.TrimSpace(gjson.GetBytes(body, "output.message").String()); message != "" {
+		upErr.Message = sanitizeUpstreamErrorMessage(message)
+	}
+	setOpsUpstreamError(c, resp.StatusCode, upErr.Message, "")
+	if status, errType, message, matched := applyErrorPassthroughRule(c, account.Platform, resp.StatusCode, body, http.StatusBadGateway, "upstream_error", "Upstream request failed"); matched {
+		upErr.StatusCode, upErr.ErrorType, upErr.Message = status, errType, message
+	}
+	writeOpenAIImagesUpstreamErrorResponse(c, upErr)
+	return nil, upErr
 }

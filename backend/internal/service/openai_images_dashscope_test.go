@@ -54,14 +54,11 @@ func dashScopeJSONResponse(status int, body string) *http.Response {
 
 func withDashScopeImageTestClock(t *testing.T) {
 	t.Helper()
-	oldSleep := dashScopeImageSleep
 	oldInterval := dashScopeImageTaskPollInterval
 	oldTimeout := dashScopeImageTaskTimeout
-	dashScopeImageSleep = func(time.Duration) {}
 	dashScopeImageTaskPollInterval = 0
 	dashScopeImageTaskTimeout = time.Second
 	t.Cleanup(func() {
-		dashScopeImageSleep = oldSleep
 		dashScopeImageTaskPollInterval = oldInterval
 		dashScopeImageTaskTimeout = oldTimeout
 	})
@@ -92,7 +89,7 @@ func TestMapDashScopeImageParameters(t *testing.T) {
 	require.NotNil(t, syncParams.PromptExtend)
 	require.True(t, *syncParams.PromptExtend)
 	require.Contains(t, syncParams.Ignored, "background")
-	require.Contains(t, syncParams.Ignored, "stream")
+	require.NotContains(t, syncParams.Ignored, "stream")
 
 	asyncParams := mapDashScopeImageParameters("wanx-v1", parsed)
 	require.Equal(t, "1024*1024", asyncParams.Size)
@@ -242,7 +239,7 @@ func TestOpenAIGatewayServiceForwardImages_NonDashScopeAccountKeepsStandardImage
 }
 
 func TestIsDashScopeUnsupportedModelError(t *testing.T) {
-	require.True(t, isDashScopeUnsupportedModelError(http.StatusBadRequest, []byte(`{"code":"InvalidParameter","message":"url error, please check url parameter. model not exist."}`)))
+	require.False(t, isDashScopeUnsupportedModelError(http.StatusBadRequest, []byte(`{"code":"InvalidParameter","message":"url error, please check url parameter. model not exist."}`)))
 	require.True(t, isDashScopeUnsupportedModelError(http.StatusForbidden, []byte(`{"code":"Model.AccessDenied","message":"access denied for model wanx-v1"}`)))
 	require.False(t, isDashScopeUnsupportedModelError(http.StatusBadRequest, []byte(`{"code":"InvalidParameter","message":"prompt is empty"}`)))
 	require.False(t, isDashScopeUnsupportedModelError(http.StatusTooManyRequests, []byte(`{"code":"Throttling.RateQuota","message":"Requests rate limit exceeded"}`)))
