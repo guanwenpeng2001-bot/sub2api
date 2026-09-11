@@ -459,6 +459,12 @@ func createGroupUsageRollupTriggerTestSchema(t *testing.T, ctx context.Context, 
 			require.NoError(t, err)
 		}
 	}
+	// 239 replaces the invalidate trigger with the dirty-generation protocol and
+	// is not idempotent (ADD COLUMN / CREATE TABLE), so it runs exactly once.
+	dirtySQL, readErr := migrations.FS.ReadFile("239_group_usage_rollup_dirty_generations.sql")
+	require.NoError(t, readErr)
+	_, err = tx.ExecContext(ctx, string(dirtySQL))
+	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 
 	return schema

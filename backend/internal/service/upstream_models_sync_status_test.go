@@ -118,7 +118,9 @@ func TestUpstreamModelSyncStatesManualAndPeriodic(t *testing.T) {
 					require.NotContains(t, repo.patches[0], UpstreamModelSyncCountExtraKey)
 				} else {
 					require.Equal(t, 1, extra[UpstreamModelSyncCountExtraKey])
-					success, parseErr := time.Parse(time.RFC3339Nano, extra[UpstreamModelSyncSuccessExtraKey].(string))
+					successRaw, ok := extra[UpstreamModelSyncSuccessExtraKey].(string)
+					require.True(t, ok)
+					success, parseErr := time.Parse(time.RFC3339Nano, successRaw)
 					require.NoError(t, parseErr)
 					require.False(t, success.Before(attempted))
 					if tc.status == UpstreamModelSyncPartial {
