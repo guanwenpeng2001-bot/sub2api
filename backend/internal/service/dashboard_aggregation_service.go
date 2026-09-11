@@ -23,8 +23,8 @@ const (
 	// TTL 必须覆盖 dashboard 聚合与分组日汇总两个有界阶段，避免任务中途失锁。
 	dashboardAggregationLeaderLockTTL = 5 * time.Minute
 
-	// 启动回填耗时可能远长于周期聚合，因此使用独立锁并让 TTL 严格大于回填超时。
-	dashboardAggregationGroupUsageBackfillLeaderLockKey = "dashboard:aggregation:group-usage-backfill:leader"
+	// 启动回填与周期作业共用 leader key；仓储事务锁还覆盖手动重算及 TTL 失效。
+	dashboardAggregationGroupUsageBackfillLeaderLockKey = dashboardAggregationLeaderLockKey
 	dashboardAggregationGroupUsageBackfillLeaderLockTTL = defaultDashboardAggregationBackfillTimeout + time.Minute
 )
 

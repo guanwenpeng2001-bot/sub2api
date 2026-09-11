@@ -188,7 +188,7 @@ func (c *dashboardAggregationLeaderLockRecordingCache) ReleaseLeaderLock(ctx con
 	return c.delegate.ReleaseLeaderLock(ctx, key, owner)
 }
 
-func TestDashboardAggregationService_StartupGroupSyncUsesIndependentLongLivedLeaderLock(t *testing.T) {
+func TestDashboardAggregationService_StartupGroupSyncSharesLongLivedLeaderLock(t *testing.T) {
 	delegate := &fakeLeaderLockCache{}
 	_, err := delegate.TryAcquireLeaderLock(context.Background(), dashboardAggregationLeaderLockKey, "periodic-peer", time.Hour)
 	require.NoError(t, err)
@@ -203,9 +203,12 @@ func TestDashboardAggregationService_StartupGroupSyncUsesIndependentLongLivedLea
 	svc.runStartupGroupUsageSync()
 
 	require.Len(t, cache.acquireKeys, 1)
-	require.NotEqual(t, dashboardAggregationLeaderLockKey, cache.acquireKeys[0])
+	require.Equal(t, dashboardAggregationLeaderLockKey, cache.acquireKeys[0])
 	require.Len(t, cache.acquireTTLs, 1)
 	require.Greater(t, cache.acquireTTLs[0], defaultDashboardAggregationBackfillTimeout)
+	require.Zero(t, repo.groupRollupCalls)
+	require.NoError(t, delegate.ReleaseLeaderLock(context.Background(), dashboardAggregationLeaderLockKey, "periodic-peer"))
+	svc.runStartupGroupUsageSync()
 	require.Equal(t, 1, repo.groupRollupCalls)
 }
 

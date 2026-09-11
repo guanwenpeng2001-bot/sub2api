@@ -23,7 +23,8 @@ func (r *usageLogRepository) getAllGroupUsageSummaryFromRollups(ctx context.Cont
 				COUNT(*) = 1
 					AND MAX(timezone_name) = $3
 					AND MAX(closed_before) <= $4::date AS valid,
-				MAX(closed_before) AS closed_before,
+				LEAST(MAX(closed_before), (SELECT (MIN(affected_at) AT TIME ZONE $3::text)::date
+                        FROM usage_group_rollup_dirty)) AS closed_before,
 				MAX(retained_from) AS retained_from
 			FROM usage_group_rollup_state
 			WHERE id = 1
@@ -114,14 +115,15 @@ func (r *usageLogRepository) getAllGroupUsageSummaryFromRollups(ctx context.Cont
 const groupUsageRollupSyncMaxAttempts = 3
 
 type groupUsageRollupRebuildPlan struct {
-	todayDate        string
-	retainedDate     string
-	rebuildStartDate string
-	timezoneName     string
-	timezoneChanged  bool
-	rebuildStart     time.Time
-	todayStart       time.Time
-	retainedFrom     time.Time
+	publishedGeneration int64
+	todayDate           string
+	retainedDate        string
+	rebuildStartDate    string
+	timezoneName        string
+	timezoneChanged     bool
+	rebuildStart        time.Time
+	todayStart          time.Time
+	retainedFrom        time.Time
 }
 
 // SyncGroupUsageRollups 将服务端配置时区今日以前的用量发布为分组日桶。
@@ -140,36 +142,73 @@ func (r *dashboardAggregationRepository) SyncGroupUsageRollups(ctx context.Conte
 			return nil
 		}
 	}
-	return fmt.Errorf("分组用量汇总水位在重建期间被并发回退")
+	return fmt.Errorf("分组用量在重建期间持续变化，保留原始数据回退并等待重试")
 }
 
+// All callers use one database lock. Usage writers never acquire this lock.
+// READ COMMITTED lets publication validate generations committed during rebuild.
 func (r *dashboardAggregationRepository) syncGroupUsageRollupsAttempt(ctx context.Context, todayStart time.Time) (bool, error) {
-	plan, err := r.planGroupUsageRollupRebuild(ctx, todayStart, false)
+	db, ok := r.sql.(interface {
+		BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+	})
+	if !ok {
+		return false, fmt.Errorf("分组用量重建需要独立数据库事务")
+	}
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return false, err
 	}
-	if plan == nil {
-		return false, nil
-	}
-	if err := r.rebuildGroupUsageDailyRollups(ctx, plan); err != nil {
+	defer func() { _ = tx.Rollback() }()
+	txRepo := newDashboardAggregationRepositoryWithSQL(tx)
+	if err := txRepo.prepareGroupUsageRollupRebuild(ctx, todayStart); err != nil {
 		return false, err
 	}
-	return r.publishGroupUsageRollupWatermark(ctx, todayStart, plan)
+	plan, err := txRepo.planGroupUsageRollupRebuild(ctx, todayStart, false)
+	if err != nil {
+		return false, err
+	}
+	if plan != nil {
+		if err := txRepo.rebuildGroupUsageDailyRollups(ctx, plan); err != nil {
+			return false, err
+		}
+		retry, err := txRepo.publishGroupUsageRollupWatermarkInTx(ctx, todayStart, plan)
+		if err != nil || retry {
+			return retry, err
+		}
+	}
+	return false, tx.Commit()
+}
+
+func (r *dashboardAggregationRepository) prepareGroupUsageRollupRebuild(ctx context.Context, todayStart time.Time) error {
+	if _, err := r.sql.ExecContext(ctx, `SELECT pg_advisory_xact_lock(6976, 239)`); err != nil {
+		return err
+	}
+	// Exact visible identities, never MAX(id): a smaller ID may belong to an
+	// INSERT that has started but has not committed. Capture BEFORE reading raw.
+	_, err := r.sql.ExecContext(ctx, `
+        CREATE TEMP TABLE group_usage_rebuild_dirty ON COMMIT DROP AS
+        SELECT id FROM usage_group_rollup_dirty WHERE affected_at < $1
+    `, todayStart.UTC())
+	return err
 }
 
 func (r *dashboardAggregationRepository) planGroupUsageRollupRebuild(ctx context.Context, todayStart time.Time, forUpdate bool) (*groupUsageRollupRebuildPlan, error) {
 	var closedBefore string
 	var previousRetainedFrom time.Time
 	var stateTimezoneName string
+	var publishedGeneration int64
 	query := `
-		SELECT closed_before::text, retained_from, timezone_name
+		SELECT LEAST(closed_before, (
+                SELECT (MIN(affected_at) AT TIME ZONE $1::text)::date
+                FROM usage_group_rollup_dirty
+            ))::text, retained_from, timezone_name, published_generation
 		FROM usage_group_rollup_state
 		WHERE id = 1`
 	if forUpdate {
 		query += `
 		FOR UPDATE`
 	}
-	if err := scanSingleRow(ctx, r.sql, query, nil, &closedBefore, &previousRetainedFrom, &stateTimezoneName); err != nil {
+	if err := scanSingleRow(ctx, r.sql, query, []any{service.GroupUsageTimezoneName()}, &closedBefore, &previousRetainedFrom, &stateTimezoneName, &publishedGeneration); err != nil {
 		return nil, fmt.Errorf("读取分组用量汇总水位: %w", err)
 	}
 
@@ -217,86 +256,29 @@ func (r *dashboardAggregationRepository) planGroupUsageRollupRebuild(ctx context
 		return nil, err
 	}
 	return &groupUsageRollupRebuildPlan{
-		todayDate:        todayDate,
-		retainedDate:     retainedDate,
-		rebuildStartDate: rebuildStartDate,
-		timezoneName:     timezoneName,
-		timezoneChanged:  timezoneChanged,
-		rebuildStart:     rebuildStart,
-		todayStart:       todayStart,
-		retainedFrom:     retainedFrom,
+		publishedGeneration: publishedGeneration,
+		todayDate:           todayDate,
+		retainedDate:        retainedDate,
+		rebuildStartDate:    rebuildStartDate,
+		timezoneName:        timezoneName,
+		timezoneChanged:     timezoneChanged,
+		rebuildStart:        rebuildStart,
+		todayStart:          todayStart,
+		retainedFrom:        retainedFrom,
 	}, nil
 }
 
+// Private shadow version; no reader-visible bucket is touched while aggregating.
 func (r *dashboardAggregationRepository) rebuildGroupUsageDailyRollups(ctx context.Context, plan *groupUsageRollupRebuildPlan) error {
-	if plan.timezoneChanged {
-		if _, err := r.sql.ExecContext(ctx, `DELETE FROM usage_group_daily_rollups`); err != nil {
-			return fmt.Errorf("清理分组用量日桶: %w", err)
-		}
-	} else if _, err := r.sql.ExecContext(ctx, `
-		DELETE FROM usage_group_daily_rollups
-		WHERE bucket_date >= $1::date
-	`, plan.rebuildStartDate); err != nil {
-		return fmt.Errorf("清理分组用量日桶: %w", err)
-	}
-
-	if _, err := r.sql.ExecContext(ctx, `
-		INSERT INTO usage_group_daily_rollups (bucket_date, group_id, actual_cost, computed_at)
-		SELECT
-			(created_at AT TIME ZONE $3::text)::date AS bucket_date,
-			group_id,
-			COALESCE(SUM(actual_cost), 0) AS actual_cost,
-			NOW()
-		FROM usage_logs
-		WHERE group_id IS NOT NULL
-			AND created_at >= $1
-			AND created_at < $2
-		GROUP BY 1, 2
-		ON CONFLICT (bucket_date, group_id)
-		DO UPDATE SET
-			actual_cost = EXCLUDED.actual_cost,
-			computed_at = EXCLUDED.computed_at
-	`, plan.rebuildStart.UTC(), plan.todayStart.UTC(), plan.timezoneName); err != nil {
-		return fmt.Errorf("重建分组用量日桶: %w", err)
-	}
-	return nil
-}
-
-func (r *dashboardAggregationRepository) publishGroupUsageRollupWatermark(ctx context.Context, todayStart time.Time, plan *groupUsageRollupRebuildPlan) (bool, error) {
-	if db, ok := r.sql.(*sql.DB); ok {
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
-			return false, err
-		}
-		txRepo := newDashboardAggregationRepositoryWithSQL(tx)
-		retry, err := txRepo.publishGroupUsageRollupWatermarkInTx(ctx, todayStart, plan)
-		if err != nil {
-			_ = tx.Rollback()
-			return false, err
-		}
-		if retry {
-			_ = tx.Rollback()
-			return true, nil
-		}
-		if err := tx.Commit(); err != nil {
-			return false, err
-		}
-		if err := r.deleteStaleGroupUsageDailyRollups(ctx, plan); err != nil {
-			return false, err
-		}
-		return false, nil
-	}
-	retry, err := r.publishGroupUsageRollupWatermarkInTx(ctx, todayStart, plan)
-	if err != nil {
-		return false, err
-	}
-	if retry {
-		return true, nil
-	}
-	if err := r.deleteStaleGroupUsageDailyRollups(ctx, plan); err != nil {
-		return false, err
-	}
-	return false, nil
+	_, err := r.sql.ExecContext(ctx, `
+        CREATE TEMP TABLE group_usage_rebuild_buckets ON COMMIT DROP AS
+        SELECT (created_at AT TIME ZONE $3::text)::date AS bucket_date,
+            group_id, COALESCE(SUM(actual_cost), 0) AS actual_cost, NOW() AS computed_at
+        FROM usage_logs
+        WHERE group_id IS NOT NULL AND created_at >= $1 AND created_at < $2
+        GROUP BY 1, 2
+    `, plan.rebuildStart.UTC(), plan.todayStart.UTC(), plan.timezoneName)
+	return err
 }
 
 func (r *dashboardAggregationRepository) publishGroupUsageRollupWatermarkInTx(ctx context.Context, todayStart time.Time, plan *groupUsageRollupRebuildPlan) (bool, error) {
@@ -304,34 +286,48 @@ func (r *dashboardAggregationRepository) publishGroupUsageRollupWatermarkInTx(ct
 	if err != nil {
 		return false, err
 	}
-	if current == nil {
-		return false, nil
-	}
-	if !plan.timezoneChanged && current.rebuildStart.Before(plan.rebuildStart) {
+	if current == nil || current.publishedGeneration != plan.publishedGeneration || (!plan.timezoneChanged && current.rebuildStart.Before(plan.rebuildStart)) {
 		return true, nil
 	}
-	if _, err := r.sql.ExecContext(ctx, `
-		UPDATE usage_group_rollup_state
-		SET closed_before = $1::date,
-			retained_from = $2,
-			timezone_name = $3,
-			updated_at = NOW()
-		WHERE id = 1
-	`, plan.todayDate, plan.retainedFrom, plan.timezoneName); err != nil {
-		return false, fmt.Errorf("更新分组用量汇总水位: %w", err)
+	var changed bool
+	if err := scanSingleRow(ctx, r.sql, `
+        SELECT EXISTS (
+            SELECT 1 FROM usage_group_rollup_dirty d WHERE affected_at < $1
+            AND NOT EXISTS (SELECT 1 FROM group_usage_rebuild_dirty v WHERE v.id = d.id)
+        )`, []any{plan.todayStart.UTC()}, &changed); err != nil {
+		return false, err
 	}
-	return false, nil
-}
-
-func (r *dashboardAggregationRepository) deleteStaleGroupUsageDailyRollups(ctx context.Context, plan *groupUsageRollupRebuildPlan) error {
-	if _, err := r.sql.ExecContext(ctx, `
-		DELETE FROM usage_group_daily_rollups
-		WHERE bucket_date < $1::date
-			OR bucket_date >= $2::date
-	`, plan.retainedDate, plan.todayDate); err != nil {
-		return fmt.Errorf("清理过期分组用量日桶: %w", err)
+	if changed {
+		return true, nil
 	}
-	return nil
+	// A writer committing after validation retains its uncaptured marker.
+	// Readers see the marker and usage mutation in one snapshot and use raw.
+	if plan.timezoneChanged {
+		if _, err := r.sql.ExecContext(ctx, `DELETE FROM usage_group_daily_rollups`); err != nil {
+			return false, err
+		}
+	} else if _, err := r.sql.ExecContext(ctx, `DELETE FROM usage_group_daily_rollups WHERE bucket_date >= $1::date`, plan.rebuildStartDate); err != nil {
+		return false, err
+	}
+	if _, err := r.sql.ExecContext(ctx, `
+        INSERT INTO usage_group_daily_rollups (bucket_date, group_id, actual_cost, computed_at)
+        SELECT bucket_date, group_id, actual_cost, computed_at FROM group_usage_rebuild_buckets
+    `); err != nil {
+		return false, err
+	}
+	if _, err := r.sql.ExecContext(ctx, `DELETE FROM usage_group_daily_rollups WHERE bucket_date < $1::date OR bucket_date >= $2::date`, plan.retainedDate, plan.todayDate); err != nil {
+		return false, err
+	}
+	if _, err := r.sql.ExecContext(ctx, `DELETE FROM usage_group_rollup_dirty d USING group_usage_rebuild_dirty v WHERE d.id = v.id`); err != nil {
+		return false, err
+	}
+	_, err = r.sql.ExecContext(ctx, `
+        UPDATE usage_group_rollup_state
+        SET closed_before = $1::date, retained_from = $2, timezone_name = $3,
+            published_generation = published_generation + 1, updated_at = NOW()
+        WHERE id = 1
+    `, plan.todayDate, plan.retainedFrom, plan.timezoneName)
+	return false, err
 }
 
 func lockGroupUsageRollupState(ctx context.Context, tx *sql.Tx) error {
@@ -350,7 +346,12 @@ func lockGroupUsageRollupState(ctx context.Context, tx *sql.Tx) error {
 func invalidateGroupUsageRollupsAt(ctx context.Context, tx *sql.Tx, affectedAt time.Time) error {
 	timezoneName := service.GroupUsageTimezoneName()
 	_, err := tx.ExecContext(ctx, `
-		UPDATE usage_group_rollup_state
+		WITH dirty AS (
+            INSERT INTO usage_group_rollup_dirty (affected_at) VALUES ($1::timestamptz)
+            ON CONFLICT (transaction_id, bucket_date) DO UPDATE
+            SET affected_at = LEAST(usage_group_rollup_dirty.affected_at, EXCLUDED.affected_at)
+        )
+        UPDATE usage_group_rollup_state
 		SET closed_before = LEAST(
 			closed_before,
 			($1::timestamptz AT TIME ZONE $2::text)::date
