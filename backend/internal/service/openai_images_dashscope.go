@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,7 +79,33 @@ func isDashScopeImageAccount(account *Account) bool {
 }
 
 func isDashScopeSyncImageModel(model string) bool {
-	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "qwen-image")
+	model = strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(model, "qwen-image") || model == "z-image-turbo"
+}
+
+// Qwen's original text-to-image models only accept five fixed resolutions.
+// Translate OpenAI sizes to the closest supported aspect ratio; editing and
+// newer Qwen models, Z-Image and Wan retain their own size semantics.
+func mapDashScopeModelImageSize(model, size string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model != "qwen-image" && !strings.HasPrefix(model, "qwen-image-max") && !strings.HasPrefix(model, "qwen-image-plus") {
+		return size
+	}
+	w, h, ok := strings.Cut(size, "*")
+	width, werr := strconv.Atoi(w)
+	height, herr := strconv.Atoi(h)
+	if !ok || werr != nil || herr != nil || width <= 0 || height <= 0 {
+		return size // Let upstream report an invalid explicit size.
+	}
+	presets := []struct{ width, height int }{{1328, 1328}, {1472, 1104}, {1104, 1472}, {1664, 928}, {928, 1664}}
+	best, distance := size, math.Inf(1)
+	for _, preset := range presets {
+		delta := math.Abs(math.Log(float64(width) / float64(height) / (float64(preset.width) / float64(preset.height))))
+		if delta < distance {
+			best, distance = fmt.Sprintf("%d*%d", preset.width, preset.height), delta
+		}
+	}
+	return best
 }
 
 func isDashScopeHostURL(raw string) bool {
@@ -174,7 +202,7 @@ func mapDashScopeImageSize(size string) (string, bool) {
 }
 
 func mapDashScopeImageParameters(model string, parsed *OpenAIImagesRequest) dashScopeImageParameters {
-	params := dashScopeImageParameters{N: 1, Size: dashScopeDefaultImageSize}
+	params := dashScopeImageParameters{N: 1, Size: mapDashScopeModelImageSize(model, dashScopeDefaultImageSize)}
 	if parsed == nil {
 		return params
 	}
@@ -182,7 +210,7 @@ func mapDashScopeImageParameters(model string, parsed *OpenAIImagesRequest) dash
 		params.N = parsed.N
 	}
 	size, sizeIgnored := mapDashScopeImageSize(parsed.Size)
-	params.Size = size
+	params.Size = mapDashScopeModelImageSize(model, size)
 	if sizeIgnored {
 		params.Ignored = append(params.Ignored, "size="+strings.TrimSpace(parsed.Size))
 	}
@@ -271,6 +299,16 @@ func (s *OpenAIGatewayService) forwardDashScopeImages(
 		return nil, fmt.Errorf("images endpoint requires an image model, got %q", upstreamModel)
 	}
 	SetOpsUpstreamModel(c, upstreamModel)
+	if strings.EqualFold(upstreamModel, "z-image-turbo") && (parsed.IsEdits() || parsed.N > 1) {
+		upErr := &OpenAIImagesUpstreamError{
+			StatusCode: http.StatusBadRequest,
+			ErrorType:  "invalid_request_error",
+			Code:       "unsupported_parameter",
+			Message:    "z-image-turbo supports generation of exactly one image and does not support edits",
+		}
+		writeOpenAIImagesUpstreamErrorResponse(c, upErr)
+		return nil, upErr
+	}
 	logger.LegacyPrintf(
 		"service.openai_gateway",
 		"[DashScope] Images request routing request_model=%s upstream_model=%s endpoint=%s account_type=%s",
@@ -563,6 +601,9 @@ func buildDashScopeMultimodalPayload(model string, parsed *OpenAIImagesRequest, 
 		"size": params.Size,
 		"n":    params.N,
 	}
+	if strings.EqualFold(strings.TrimSpace(model), "z-image-turbo") {
+		delete(parameters, "n") // Z-Image always returns one image; n is not in its API.
+	}
 	if params.PromptExtend != nil {
 		parameters["prompt_extend"] = *params.PromptExtend
 	}
@@ -615,15 +656,6 @@ func (s *OpenAIGatewayService) doDashScopeImageJSON(
 		return nil, err
 	}
 	req = req.WithContext(WithHTTPUpstreamProfile(req.Context(), HTTPUpstreamProfileOpenAI))
-	req.Header.Set("Authorization", "Bearer "+token)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	for key, values := range extraHeader {
-		for _, value := range values {
-			req.Header.Add(key, value)
-		}
-	}
 	if c != nil && c.Request != nil {
 		for key, values := range c.Request.Header {
 			if !openaiPassthroughAllowedHeaders[strings.ToLower(key)] {
@@ -635,6 +667,25 @@ func (s *OpenAIGatewayService) doDashScopeImageJSON(
 		}
 	}
 	account.ApplyHeaderOverrides(req.Header)
+	// This is a newly encoded native JSON request, including when the client
+	// submitted multipart edits. Never append the client's media types: duplicate
+	// Content-Type values become application/json,application/json at DashScope.
+	for key := range req.Header {
+		switch strings.ToLower(key) {
+		case "content-type", "accept", "authorization", "x-dashscope-async":
+			delete(req.Header, key)
+		}
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for key, values := range extraHeader {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
 	proxyURL := ""
 	if account.ProxyID != nil && account.Proxy != nil {
 		proxyURL = account.Proxy.URL()
@@ -748,7 +799,10 @@ func (s *OpenAIGatewayService) buildDashScopeOpenAIImagesResponse(
 	images []dashScopeImageResult,
 	upstreamBody []byte,
 ) ([]byte, OpenAIUsage, int, error) {
-	wantB64 := parsed != nil && strings.EqualFold(strings.TrimSpace(parsed.ResponseFormat), "b64_json")
+	// Deliver self-contained images by default, so SDK callers do not need to
+	// resolve and fetch expiring OSS URLs themselves. Explicit URL requests keep
+	// the lightweight URL-only response; successful downloads retain the URL too.
+	wantB64 := parsed == nil || strings.TrimSpace(parsed.ResponseFormat) == "" || strings.EqualFold(strings.TrimSpace(parsed.ResponseFormat), "b64_json")
 	// Capture all upstream consumption before any delivery operation can fail.
 	usage, usageOK := parseDashScopeImageUsage(upstreamBody)
 	imageCount := len(images)

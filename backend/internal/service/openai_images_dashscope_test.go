@@ -65,7 +65,7 @@ func withDashScopeImageTestClock(t *testing.T) {
 }
 
 func TestIsDashScopeImageGenerationModel(t *testing.T) {
-	for _, model := range []string{"qwen-image", "Qwen-Image-Plus", "qwen-image-edit", "wanx-v1", "wanx2.1-t2i-turbo", "wan2.2-t2i-flash", "wan2.5-t2i-preview"} {
+	for _, model := range []string{"qwen-image", "Qwen-Image-Plus", "qwen-image-max", "qwen-image-edit", "z-image-turbo", "wanx-v1", "wanx2.1-t2i-turbo", "wan2.2-t2i-flash", "wan2.5-t2i-preview"} {
 		require.True(t, isDashScopeImageGenerationModel(model), model)
 	}
 	for _, model := range []string{"qwen-plus", "qwen-max", "wandb", "wan", "gpt-image-2", "grok-imagine-image", ""} {
@@ -84,7 +84,7 @@ func TestNormalizeDashScopeNativeAPIBase(t *testing.T) {
 func TestMapDashScopeImageParameters(t *testing.T) {
 	parsed := &OpenAIImagesRequest{N: 2, Size: "1024x1024", Quality: "high", Background: "transparent", Stream: true}
 	syncParams := mapDashScopeImageParameters("qwen-image-plus", parsed)
-	require.Equal(t, "1024*1024", syncParams.Size)
+	require.Equal(t, "1328*1328", syncParams.Size)
 	require.Equal(t, 2, syncParams.N)
 	require.NotNil(t, syncParams.PromptExtend)
 	require.True(t, *syncParams.PromptExtend)
@@ -155,7 +155,7 @@ func TestOpenAIGatewayServiceForwardImages_DashScopeSyncMultimodalGeneration(t *
 	require.Equal(t, "Bearer sk-dashscope-test", upstream.lastReq.Header.Get("Authorization"))
 	require.Equal(t, "qwen-image-plus", gjson.GetBytes(upstream.lastBody, "model").String())
 	require.NotEqual(t, "gpt-5.6-sol", gjson.GetBytes(upstream.lastBody, "model").String())
-	require.Equal(t, "1024*1024", gjson.GetBytes(upstream.lastBody, "parameters.size").String())
+	require.Equal(t, "1328*1328", gjson.GetBytes(upstream.lastBody, "parameters.size").String())
 	require.Equal(t, int64(1), gjson.GetBytes(upstream.lastBody, "parameters.n").Int())
 	require.True(t, gjson.GetBytes(upstream.lastBody, "parameters.prompt_extend").Bool())
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -396,4 +396,42 @@ func TestOpenAIGatewayServiceForwardImages_DashScopeSyncDataURIReturnsB64(t *tes
 	require.NoError(t, err)
 	require.Equal(t, 1, result.ImageCount)
 	require.Equal(t, pngB64, gjson.Get(rec.Body.String(), "data.0.b64_json").String())
+}
+
+func TestMapDashScopeModelImageSize(t *testing.T) {
+	for _, tc := range []struct{ model, size, want string }{
+		{"qwen-image-max", "1024x1024", "1328*1328"},
+		{"qwen-image-max-2025-12-30", "1536x1024", "1472*1104"},
+		{"qwen-image-plus", "1024x1536", "1104*1472"},
+		{"qwen-image", "1920x1080", "1664*928"},
+		{"qwen-image-max", "1080x1920", "928*1664"},
+		{"qwen-image-max", "1664*928", "1664*928"},
+		{"qwen-image-max", "auto", "1328*1328"},
+		{"qwen-image-max", "", "1328*1328"},
+		{"qwen-image-max", "0x1024", "0*1024"},
+		{"qwen-image-2.0-pro", "1024x1024", "1024*1024"},
+		{"qwen-image-edit-max", "1024x1024", "1024*1024"},
+		{"z-image-turbo", "1024x1024", "1024*1024"},
+		{"wan2.2-t2i-flash", "1024x1024", "1024*1024"},
+	} {
+		t.Run(tc.model+"/"+tc.size, func(t *testing.T) {
+			require.Equal(t, tc.want, mapDashScopeImageParameters(tc.model, &OpenAIImagesRequest{Size: tc.size}).Size)
+		})
+	}
+	require.Equal(t, "1328*1328", mapDashScopeImageParameters("qwen-image-max", nil).Size)
+}
+
+func TestDashScopeZImageRejectsEditsAndMultipleImages(t *testing.T) {
+	for _, parsed := range []*OpenAIImagesRequest{
+		{Model: "z-image-turbo", Prompt: "cat", N: 2},
+		{Model: "z-image-turbo", Prompt: "cat", N: 1, Endpoint: "/v1/images/edits"},
+	} {
+		c, rec := newDashScopeImagesTestContext(t, nil)
+		upstream := &httpUpstreamRecorder{}
+		svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+		_, err := svc.ForwardImages(context.Background(), c, newDashScopeImageAccount(), nil, parsed, "")
+		require.Error(t, err)
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+		require.Empty(t, upstream.requests)
+	}
 }

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 // Use a real net/http client with no Client.Timeout: cancellation must reach
@@ -204,3 +206,117 @@ func TestDashScopeDownloadHTTPFailurePreservesAllUsage(t *testing.T) {
 type dashScopeFailedImageReader struct{}
 
 func (dashScopeFailedImageReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+// Exercise wire headers with a real HTTP transport: Header.Get only sees the
+// first value and missed the duplicate Content-Type that DashScope rejects.
+func TestDashScopeNativeWireProtocol(t *testing.T) {
+	for _, model := range []string{"qwen-image-max", "z-image-turbo", "wan2.2-t2i-flash"} {
+		t.Run(model, func(t *testing.T) {
+			withDashScopeImageTestClock(t)
+			type wireRequest struct {
+				method, path string
+				header       http.Header
+				body         []byte
+			}
+			requests := make(chan wireRequest, 3)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				requests <- wireRequest{r.Method, r.URL.Path, r.Header.Clone(), body}
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/api/v1/services/aigc/multimodal-generation/generation":
+					_, _ = io.WriteString(w, `{"output":{"choices":[{"message":{"content":[{"image":"https://cdn.example.com/test.png"}]}}]},"usage":{"image_count":1}}`)
+				case "/api/v1/services/aigc/text2image/image-synthesis":
+					_, _ = io.WriteString(w, `{"output":{"task_id":"task-1","task_status":"PENDING"}}`)
+				case "/api/v1/tasks/task-1":
+					_, _ = io.WriteString(w, `{"output":{"task_status":"SUCCEEDED","results":[{"url":"https://cdn.example.com/test.png"}]},"usage":{"image_count":1}}`)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			target, err := url.Parse(server.URL)
+			require.NoError(t, err)
+			svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: &dashScopeNetworkUpstream{client: server.Client(), target: target}}
+			body := []byte(fmt.Sprintf(`{"model":%q,"prompt":"a cube","n":1,"size":"1024x1024","response_format":"url"}`, model))
+			c, rec := newDashScopeImagesTestContext(t, body)
+			parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+			require.NoError(t, err)
+			// Native encoding must also replace multipart and repeated SDK headers.
+			c.Request.Header.Add("Content-Type", "multipart/form-data; boundary=test")
+			c.Request.Header["accept"] = []string{"application/json", "text/event-stream"}
+			c.Request.Header.Set("X-DashScope-Async", "disable")
+			c.Request.Header.Set("User-Agent", "dashscope-regression")
+			account := newDashScopeImageAccount()
+			account.Credentials["header_override_enabled"] = true
+			account.Credentials["header_overrides"] = map[string]any{"accept": "text/event-stream", "content-type": "text/plain", "user-agent": "native-test"}
+			result, err := svc.ForwardImages(context.Background(), c, account, body, parsed, "")
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.Equal(t, 1, result.ImageCount)
+			close(requests)
+			count := 0
+			for req := range requests {
+				count++
+				require.Equal(t, []string{"application/json"}, req.header.Values("Accept"))
+				require.Equal(t, []string{"Bearer sk-dashscope-test"}, req.header.Values("Authorization"))
+				if req.method == http.MethodPost {
+					require.Equal(t, []string{"application/json"}, req.header.Values("Content-Type"))
+					require.Equal(t, model, gjson.GetBytes(req.body, "model").String())
+					if model == "wan2.2-t2i-flash" {
+						require.Equal(t, "/api/v1"+dashScopeText2ImagePath, req.path)
+						require.Equal(t, []string{"enable"}, req.header.Values(dashScopeAsyncHeaderName))
+						require.Equal(t, "a cube", gjson.GetBytes(req.body, "input.prompt").String())
+					} else {
+						require.Equal(t, "/api/v1"+dashScopeMultimodalGenerationPath, req.path)
+						require.Empty(t, req.header.Values(dashScopeAsyncHeaderName))
+						require.Equal(t, "a cube", gjson.GetBytes(req.body, "input.messages.0.content.0.text").String())
+						if model == "qwen-image-max" {
+							require.Equal(t, "1328*1328", gjson.GetBytes(req.body, "parameters.size").String())
+						} else {
+							require.Equal(t, "1024*1024", gjson.GetBytes(req.body, "parameters.size").String())
+							require.False(t, gjson.GetBytes(req.body, "parameters.n").Exists())
+						}
+					}
+				} else {
+					require.Equal(t, http.MethodGet, req.method)
+					require.Empty(t, req.header.Values("Content-Type"))
+					require.Empty(t, req.header.Values(dashScopeAsyncHeaderName))
+				}
+			}
+			if model == "wan2.2-t2i-flash" {
+				require.Equal(t, 2, count)
+			} else {
+				require.Equal(t, 1, count)
+			}
+		})
+	}
+}
+
+func TestDashScopeDefaultResponseIncludesImageBytes(t *testing.T) {
+	for _, format := range []string{"", "b64_json", "url"} {
+		t.Run("format="+format, func(t *testing.T) {
+			upstream := &httpUpstreamRecorder{responses: []*http.Response{
+				dashScopeJSONResponse(200, `{"output":{"choices":[{"message":{"content":[{"image":"https://cdn.example.com/image.png"}]}}]},"usage":{"image_count":1}}`),
+				b64BackfillImageResponse(200, "image/png", b64BackfillPNGBytes),
+			}}
+			svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+			c, rec := newDashScopeImagesTestContext(t, nil)
+			parsed := &OpenAIImagesRequest{Model: "qwen-image-max", Prompt: "a cube", N: 1, ResponseFormat: format}
+			result, err := svc.ForwardImages(context.Background(), c, newDashScopeImageAccount(), nil, parsed, "")
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.Equal(t, 1, result.ImageCount)
+			require.Equal(t, "https://cdn.example.com/image.png", gjson.Get(rec.Body.String(), "data.0.url").String())
+			if format == "url" {
+				require.Len(t, upstream.requests, 1)
+				require.False(t, gjson.Get(rec.Body.String(), "data.0.b64_json").Exists())
+			} else {
+				require.Len(t, upstream.requests, 2)
+				require.Equal(t, base64.StdEncoding.EncodeToString(b64BackfillPNGBytes), gjson.Get(rec.Body.String(), "data.0.b64_json").String())
+				require.Empty(t, upstream.requests[1].Header.Get("Authorization"))
+				require.True(t, HTTPUpstreamPublicHostsOnly(upstream.requests[1].Context()))
+			}
+		})
+	}
+}

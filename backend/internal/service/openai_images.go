@@ -475,7 +475,7 @@ func isDashScopeImageGenerationModel(model string) bool {
 	if model == "" {
 		return false
 	}
-	if strings.HasPrefix(model, "qwen-image") || strings.HasPrefix(model, "wanx") {
+	if strings.HasPrefix(model, "qwen-image") || model == "z-image-turbo" || strings.HasPrefix(model, "wanx") {
 		return true
 	}
 	if !strings.HasPrefix(model, "wan") {
