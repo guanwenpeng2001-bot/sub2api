@@ -1400,13 +1400,26 @@ func (s *GatewayService) listModelDiscoveryAccounts(ctx context.Context, groupID
 	return accounts, err
 }
 
+// AvailableModelCatalog distinguishes discovery from static suggestions. Static and
+// mixed catalogs must not be treated as evidence of a group's actual capability.
+type AvailableModelCatalog struct {
+	Models []string
+	Source string
+}
+
 func (s *GatewayService) GetAvailableModels(ctx context.Context, groupID *int64, platform string) []string {
+	catalog, _ := s.GetAvailableModelCatalog(ctx, groupID, platform)
+	return catalog.Models
+}
+
+func (s *GatewayService) GetAvailableModelCatalog(ctx context.Context, groupID *int64, platform string) (AvailableModelCatalog, error) {
 	cacheKey := modelsListCacheKey(groupID, platform)
 	if s.modelsListCache != nil {
 		if cached, found := s.modelsListCache.Get(cacheKey); found {
-			if models, ok := cached.([]string); ok {
+			if catalog, ok := cached.(AvailableModelCatalog); ok {
 				modelsListCacheHitTotal.Add(1)
-				return cloneStringSlice(models)
+				catalog.Models = cloneStringSlice(catalog.Models)
+				return catalog, nil
 			}
 		}
 	}
@@ -1414,8 +1427,8 @@ func (s *GatewayService) GetAvailableModels(ctx context.Context, groupID *int64,
 
 	accounts, err := s.listModelDiscoveryAccounts(ctx, groupID, platform)
 
-	if err != nil || len(accounts) == 0 {
-		return nil
+	if err != nil {
+		return AvailableModelCatalog{Source: "query_failed"}, err
 	}
 
 	// Filter by platform if specified
@@ -1429,38 +1442,53 @@ func (s *GatewayService) GetAvailableModels(ctx context.Context, groupID *int64,
 		accounts = filtered
 	}
 
+	store := func(models []string, source string) (AvailableModelCatalog, error) {
+		catalog := AvailableModelCatalog{Models: cloneStringSlice(models), Source: source}
+		if s.modelsListCache != nil {
+			s.modelsListCache.Set(cacheKey, catalog, s.modelsListCacheTTL)
+			modelsListCacheStoreTotal.Add(1)
+		}
+		catalog.Models = cloneStringSlice(catalog.Models)
+		return catalog, nil
+	}
+	if len(accounts) == 0 {
+		return store(nil, "authoritative_empty")
+	}
+
 	// Collect unique models from all accounts
 	modelSet := make(map[string]struct{})
 	hasAnyMapping := false
+	hasExplicitMapping, hasStaticMapping := false, false
 
 	for _, acc := range accounts {
 		// Passthrough routing accepts models independently of model_mapping. A stale
 		// mapping on any eligible passthrough account therefore cannot define the
 		// public whitelist; return nil so the handler uses its default model set.
 		if platform == PlatformOpenAI && acc.IsOpenAIPassthroughEnabled() {
-			if s.modelsListCache != nil {
-				s.modelsListCache.Set(cacheKey, []string(nil), s.modelsListCacheTTL)
-				modelsListCacheStoreTotal.Add(1)
-			}
-			return nil
+			return store(nil, "static_default")
 		}
 
 		mapping := acc.GetModelMapping()
 		if len(mapping) > 0 {
 			hasAnyMapping = true
+			rawMapping, _ := acc.Credentials["model_mapping"].(map[string]any)
 			for model := range mapping {
 				modelSet[model] = struct{}{}
+				if _, explicit := rawMapping[model].(string); explicit {
+					hasExplicitMapping = true
+				} else {
+					hasStaticMapping = true
+				}
 			}
 		}
 	}
 
-	// If no account has model_mapping, return nil (use default)
+	// CN catalogs are mapping-only; no mappings means an authoritative empty listing.
 	if !hasAnyMapping {
-		if s.modelsListCache != nil {
-			s.modelsListCache.Set(cacheKey, []string(nil), s.modelsListCacheTTL)
-			modelsListCacheStoreTotal.Add(1)
+		if IsCNProvider(platform) {
+			return store(nil, "authoritative_empty")
 		}
-		return nil
+		return store(nil, "static_default")
 	}
 
 	// Convert to slice
@@ -1470,15 +1498,21 @@ func (s *GatewayService) GetAvailableModels(ctx context.Context, groupID *int64,
 	}
 	sort.Strings(models)
 
+	source := "account_mapping"
+	if hasStaticMapping {
+		source = "static_default"
+	}
+	if hasStaticMapping && hasExplicitMapping {
+		source = "mixed"
+	}
 	if platform == PlatformOpenAI {
-		models = supplementUnmappedOpenAIModels(accounts, models)
+		supplemented := supplementUnmappedOpenAIModels(accounts, models)
+		if len(supplemented) > len(models) {
+			source = "mixed"
+		}
+		models = supplemented
 	}
-
-	if s.modelsListCache != nil {
-		s.modelsListCache.Set(cacheKey, cloneStringSlice(models), s.modelsListCacheTTL)
-		modelsListCacheStoreTotal.Add(1)
-	}
-	return cloneStringSlice(models)
+	return store(models, source)
 }
 
 func (s *GatewayService) resolveCompositeModelOwnership(ctx context.Context, groupID int64, model string) (CompositeModelOwnership, error) {

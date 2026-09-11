@@ -1119,7 +1119,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 // Models handles listing available models
 // GET /v1/models
 // Returns models based on account configurations (model_mapping whitelist)
-// Falls back to default models if no whitelist is configured
+// Static defaults are suggestions only; discovery errors and empty catalogs stay distinct.
 func (h *GatewayHandler) Models(c *gin.Context) {
 	apiKey, _ := middleware2.GetAPIKeyFromContext(c)
 
@@ -1140,62 +1140,36 @@ func (h *GatewayHandler) Models(c *gin.Context) {
 		return
 	}
 
+	var catalog service.AvailableModelCatalog
+	var err error
 	if platform == service.PlatformComposite {
-		availableModels := h.compositeAvailableModels(c.Request.Context(), groupID)
-		if apiKey != nil && apiKey.Group != nil && apiKey.Group.ModelAllowlistEnabled() {
-			source := availableModels
-			if len(source) == 0 {
-				source = defaultModelIDsForPlatform(service.PlatformComposite)
-			}
-			writeAllowlistedModelsList(c, service.PlatformComposite, apiKey.Group.ModelAllowlist.FilterForListing(source))
-			return
+		catalog, err = h.compositeModelCatalog(c.Request.Context(), groupID)
+	} else {
+		catalog, err = h.gatewayService.GetAvailableModelCatalog(c.Request.Context(), groupID, platform)
+		if catalog.Source == "static_default" && len(catalog.Models) == 0 {
+			catalog.Models = defaultModelIDsForPlatform(platform)
 		}
-		if len(availableModels) > 0 {
-			writeModelsList(c, service.PlatformComposite, availableModels)
-			return
-		}
-		writeModelsList(c, service.PlatformComposite, defaultModelIDsForPlatform(service.PlatformComposite))
+	}
+	if err != nil {
+		c.Header("X-Model-Catalog-Source", "query_failed")
+		logger.FromContext(c.Request.Context()).Warn("gateway.models.discovery_failed", zap.String("platform", platform), zap.String("source", "query_failed"), zap.Error(err))
+		c.JSON(http.StatusServiceUnavailable, gin.H{"source": "query_failed", "authoritative": false, "error": gin.H{"type": "api_error", "message": "Model catalog query failed"}})
 		return
 	}
-
-	// Get available models from account configurations for the selected group platform.
-	availableModels := h.gatewayService.GetAvailableModels(c.Request.Context(), groupID, platform)
 	if apiKey != nil && apiKey.Group != nil && apiKey.Group.ModelAllowlistEnabled() {
-		source := modelListingSource(platform, availableModels, defaultModelIDsForPlatform(platform))
-		writeAllowlistedModelsList(c, platform, apiKey.Group.ModelAllowlist.FilterForListing(source))
-		return
+		if platform == service.PlatformAnthropic && len(catalog.Models) > 0 && catalog.Source == "account_mapping" {
+			merged := modelListingSource(platform, catalog.Models, defaultModelIDsForPlatform(platform))
+			if len(merged) > len(catalog.Models) {
+				catalog.Source = "mixed"
+			}
+			catalog.Models = merged
+		}
+		catalog.Models = apiKey.Group.ModelAllowlist.FilterForListing(catalog.Models)
 	}
-
-	if len(availableModels) > 0 {
-		writeModelsList(c, platform, availableModels)
-		return
-	}
-
-	// Fallback to default models
-	if platform == service.PlatformOpenAI {
-		c.JSON(http.StatusOK, gin.H{
-			"object": "list",
-			"data":   openai.DefaultModels,
-		})
-		return
-	}
-
-	if platform == service.PlatformGemini {
-		c.JSON(http.StatusOK, gin.H{
-			"object": "list",
-			"data":   geminicli.DefaultModels,
-		})
-		return
-	}
-	if platform == service.PlatformGrok {
-		writeGrokModelsList(c, xai.DefaultModelIDs())
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"object": "list",
-		"data":   claude.DefaultModels,
-	})
+	c.Set("model_catalog_source", catalog.Source)
+	c.Header("X-Model-Catalog-Source", catalog.Source)
+	logger.FromContext(c.Request.Context()).Info("gateway.models.list", zap.String("platform", platform), zap.String("source", catalog.Source), zap.Int("model_count", len(catalog.Models)))
+	writeModelsList(c, platform, catalog.Models)
 }
 
 // CodexModels returns the effective group model list using the manifest shape
@@ -1246,18 +1220,10 @@ func (h *GatewayHandler) codexModelIDsForGroup(ctx context.Context, group *servi
 	}
 	if platform == service.PlatformComposite {
 		availableModels := h.compositeAvailableModels(ctx, groupID)
-		fallbackModels := defaultCodexModelIDsForPlatform(service.PlatformComposite)
 		if group.ModelAllowlistEnabled() {
-			source := availableModels
-			if len(source) == 0 {
-				source = fallbackModels
-			}
-			return group.ModelAllowlist.FilterForListing(source)
+			return group.ModelAllowlist.FilterForListing(availableModels)
 		}
-		if len(availableModels) > 0 {
-			return availableModels
-		}
-		return fallbackModels
+		return availableModels
 	}
 
 	availableModels := h.gatewayService.GetAvailableModels(ctx, groupID, platform)
@@ -1272,34 +1238,48 @@ func (h *GatewayHandler) codexModelIDsForGroup(ctx context.Context, group *servi
 }
 
 func (h *GatewayHandler) compositeAvailableModels(ctx context.Context, groupID *int64) []string {
-	if h == nil || h.gatewayService == nil {
-		return nil
-	}
-	seen := make(map[string]struct{})
+	catalog, _ := h.compositeModelCatalog(ctx, groupID)
+	return catalog.Models
+}
+
+func (h *GatewayHandler) compositeModelCatalog(ctx context.Context, groupID *int64) (service.AvailableModelCatalog, error) {
 	models := make([]string, 0)
-	schedulablePlatforms := h.gatewayService.GetSchedulablePlatforms(ctx, groupID)
+	mapped, static := false, false
 	for _, platform := range []string{service.PlatformAnthropic, service.PlatformGemini, service.PlatformOpenAI, service.PlatformAntigravity, service.PlatformGrok, service.PlatformKimi, service.PlatformZhipu, service.PlatformDeepseek, service.PlatformMiniMax} {
-		platformModels := h.gatewayService.GetAvailableModels(ctx, groupID, platform)
-		if len(platformModels) == 0 {
-			// CN 供应商没有静态默认模型列表（defaultModelIDsForPlatform 的
-			// default 分支是 Claude 列表），composite 下只暴露账号映射键。
-			if _, ok := schedulablePlatforms[platform]; ok && !service.IsCNProvider(platform) {
-				platformModels = defaultModelIDsForPlatform(platform)
-			}
+		catalog, err := h.gatewayService.GetAvailableModelCatalog(ctx, groupID, platform)
+		if err != nil {
+			return service.AvailableModelCatalog{Source: "query_failed"}, err
 		}
-		for _, model := range platformModels {
-			model = strings.TrimSpace(model)
-			if model == "" {
-				continue
-			}
-			if _, ok := seen[model]; ok {
-				continue
-			}
-			seen[model] = struct{}{}
-			models = append(models, model)
+		if catalog.Source == "static_default" && len(catalog.Models) == 0 && !service.IsCNProvider(platform) {
+			catalog.Models = defaultModelIDsForPlatform(platform)
 		}
+		if len(catalog.Models) == 0 {
+			continue
+		}
+		mapped = mapped || catalog.Source == "account_mapping" || catalog.Source == "mixed"
+		static = static || catalog.Source == "static_default" || catalog.Source == "mixed"
+		models = mergeModelIDs(models, catalog.Models)
 	}
-	return models
+	source := "authoritative_empty"
+	if mapped {
+		source = "account_mapping"
+	}
+	if static {
+		source = "static_default"
+	}
+	if mapped && static {
+		source = "mixed"
+	}
+	return service.AvailableModelCatalog{Models: models, Source: source}, nil
+}
+
+func modelListPayload(c *gin.Context, models any) gin.H {
+	payload := gin.H{"object": "list", "data": models}
+	if source := c.GetString("model_catalog_source"); source != "" {
+		payload["source"] = source
+		payload["authoritative"] = source == "account_mapping" || source == "authoritative_empty"
+	}
+	return payload
 }
 
 func writeModelsList(c *gin.Context, platform string, modelIDs []string) {
@@ -1320,10 +1300,7 @@ func writeModelsList(c *gin.Context, platform string, modelIDs []string) {
 			CreatedAt:   "2024-01-01T00:00:00Z",
 		})
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"object": "list",
-		"data":   models,
-	})
+	c.JSON(http.StatusOK, modelListPayload(c, models))
 }
 
 func writeAllowlistedModelsList(c *gin.Context, platform string, modelIDs []string) {
@@ -1382,10 +1359,7 @@ func writeGrokModelsList(c *gin.Context, modelIDs []string) {
 		models = append(models, item)
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"object": "list",
-		"data":   models,
-	})
+	c.JSON(http.StatusOK, modelListPayload(c, models))
 }
 
 func grokModelSupportsConfigurableReasoning(modelID string) bool {
@@ -1411,10 +1385,7 @@ func writeOpenAIModelsList(c *gin.Context, modelIDs []string) {
 		}
 		models = append(models, openAIModelForID(modelID))
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"object": "list",
-		"data":   models,
-	})
+	c.JSON(http.StatusOK, modelListPayload(c, models))
 }
 
 // modelListingSource 汇总模型列表过滤的候选来源：账号映射键（availableModels）
@@ -1475,12 +1446,10 @@ func defaultModelIDsForPlatform(platform string) []string {
 			}
 		}
 		return ids
+	case "":
+		return claude.DefaultModelIDs()
 	default:
-		ids := make([]string, 0, len(claude.DefaultModels))
-		for _, model := range claude.DefaultModels {
-			ids = append(ids, model.ID)
-		}
-		return ids
+		return nil
 	}
 }
 
@@ -1517,10 +1486,7 @@ func (h *GatewayHandler) AntigravityModels(c *gin.Context) {
 		}
 		models = filtered
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"object": "list",
-		"data":   models,
-	})
+	c.JSON(http.StatusOK, modelListPayload(c, models))
 }
 
 func cloneAPIKeyWithGroup(apiKey *service.APIKey, group *service.Group) *service.APIKey {

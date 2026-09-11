@@ -209,3 +209,59 @@ func TestFixQUnscopedAndCompositeDiscoveryUseProjection(t *testing.T) {
 	require.Contains(t, svc.GetSchedulablePlatforms(context.Background(), &id), PlatformGemini)
 	require.Equal(t, 3, repo.calls)
 }
+
+// Discovery errors must remain errors, while cached emptiness must retain its source.
+type catalogSourceRepo struct {
+	AccountRepository
+	accounts []Account
+	err      error
+	calls    int
+}
+
+func (r *catalogSourceRepo) ListModelDiscoveryAccounts(context.Context, *int64, string) ([]Account, error) {
+	r.calls++
+	return r.accounts, r.err
+}
+func TestAvailableModelCatalog_CacheSourcesAndRecovery(t *testing.T) {
+	for _, platform := range []string{PlatformKimi, PlatformZhipu, PlatformDeepseek, PlatformMiniMax, PlatformOpenAI} {
+		t.Run(platform, func(t *testing.T) {
+			repo := &catalogSourceRepo{err: errors.New("query failed")}
+			svc := &GatewayService{accountRepo: repo, modelsListCache: gocache.New(time.Minute, 0), modelsListCacheTTL: time.Minute}
+			groupID := int64(7)
+			catalog, err := svc.GetAvailableModelCatalog(context.Background(), &groupID, platform)
+			require.ErrorIs(t, err, repo.err)
+			require.Equal(t, "query_failed", catalog.Source)
+			repo.err = nil
+			for i := 0; i < 2; i++ {
+				catalog, err = svc.GetAvailableModelCatalog(context.Background(), &groupID, platform)
+				require.NoError(t, err)
+				require.Equal(t, "authoritative_empty", catalog.Source)
+				require.Empty(t, catalog.Models)
+			}
+			require.Equal(t, 2, repo.calls)
+			repo.accounts = []Account{{ID: 1, Platform: platform}}
+			svc.InvalidateAvailableModelsCache(&groupID, platform)
+			for i := 0; i < 2; i++ {
+				catalog, err = svc.GetAvailableModelCatalog(context.Background(), &groupID, platform)
+				require.NoError(t, err)
+				want := "authoritative_empty"
+				if platform == PlatformOpenAI {
+					want = "static_default"
+				}
+				require.Equal(t, want, catalog.Source)
+			}
+			require.Equal(t, 3, repo.calls)
+			repo.accounts[0].Credentials = map[string]any{"model_mapping": map[string]any{"alias": "upstream"}}
+			svc.InvalidateAvailableModelsCache(&groupID, platform)
+			catalog, err = svc.GetAvailableModelCatalog(context.Background(), &groupID, platform)
+			require.NoError(t, err)
+			require.Equal(t, "account_mapping", catalog.Source)
+			require.Equal(t, []string{"alias"}, catalog.Models)
+			catalog.Models[0] = "caller mutation"
+			catalog, err = svc.GetAvailableModelCatalog(context.Background(), &groupID, platform)
+			require.NoError(t, err)
+			require.Equal(t, []string{"alias"}, catalog.Models)
+			require.Equal(t, 4, repo.calls)
+		})
+	}
+}

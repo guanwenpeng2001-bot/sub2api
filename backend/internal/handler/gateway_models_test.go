@@ -3,11 +3,12 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
-	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -19,6 +20,7 @@ type gatewayModelsAccountRepoStub struct {
 	service.AccountRepository
 
 	byGroup map[int64][]service.Account
+	err     error
 }
 
 type gatewayModelsResponseForTest struct {
@@ -60,6 +62,9 @@ type gatewayReasoningEffortOptionForTest struct {
 }
 
 func (s *gatewayModelsAccountRepoStub) ListSchedulableByGroupID(ctx context.Context, groupID int64) ([]service.Account, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
 	accounts, ok := s.byGroup[groupID]
 	if !ok {
 		return nil, nil
@@ -999,15 +1004,9 @@ func TestGatewayModels_CompositeUnmappedCNAccountsContributeNoDefaults(t *testin
 	require.NotContains(t, ids, "claude-sonnet-4-6")
 }
 
-// 独立 CN 分组沿用 default 分支的 Claude 默认列表（Claude Code 客户端请求的
-// 就是这些模型名并经账号 model_mapping 转换），composite 支持不得改变该回退。
-func TestDefaultModelIDsForPlatform_CNProvidersKeepClaudeDefaults(t *testing.T) {
-	want := make([]string, 0, len(claude.DefaultModels))
-	for _, model := range claude.DefaultModels {
-		want = append(want, model.ID)
-	}
-	for _, platform := range []string{service.PlatformKimi, service.PlatformZhipu, service.PlatformDeepseek, service.PlatformMiniMax} {
-		require.Equal(t, want, defaultModelIDsForPlatform(platform), "platform=%s", platform)
+func TestDefaultModelIDsForPlatform_CNProvidersHaveNoStaticCatalog(t *testing.T) {
+	for _, platform := range []string{service.PlatformKimi, service.PlatformZhipu, service.PlatformDeepseek, service.PlatformMiniMax, "unknown-provider"} {
+		require.Empty(t, defaultModelIDsForPlatform(platform), "platform=%s", platform)
 	}
 }
 
@@ -1412,4 +1411,138 @@ func modelIDsForTest(models []gatewayModelItemForTest) []string {
 		ids = append(ids, model.ID)
 	}
 	return ids
+}
+
+func TestGatewayModels_CatalogSources(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, platform := range []string{service.PlatformKimi, service.PlatformZhipu, service.PlatformDeepseek, service.PlatformMiniMax, service.PlatformComposite} {
+		for _, scenario := range []string{"no_accounts", "unmapped", "mapped", "query_failed"} {
+			for _, allowlisted := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/allowlisted=%t", platform, scenario, allowlisted), func(t *testing.T) {
+					accountPlatform := platform
+					if platform == service.PlatformComposite {
+						accountPlatform = service.PlatformZhipu
+					}
+					repo := &gatewayModelsAccountRepoStub{byGroup: map[int64][]service.Account{}}
+					source := "authoritative_empty"
+					if scenario != "no_accounts" {
+						account := service.Account{ID: 1, Platform: accountPlatform}
+						if scenario == "mapped" {
+							account.Credentials = map[string]any{"model_mapping": map[string]any{"provider-model": "provider-model"}}
+							source = "account_mapping"
+						}
+						repo.byGroup[1] = []service.Account{account}
+					}
+					if scenario == "query_failed" {
+						repo.err = errors.New("discovery unavailable")
+						source = "query_failed"
+					}
+					h := newGatewayModelsHandlerForTest(repo)
+					// Repeat to cover cached empty and mapped results, then recover from a failed query.
+					for attempt := 0; attempt < 2; attempt++ {
+						rec := httptest.NewRecorder()
+						c, _ := gin.CreateTestContext(rec)
+						c.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+						c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{Group: &service.Group{ID: 1, Platform: platform, ModelAllowlist: service.GroupModelAllowlist{Enabled: allowlisted, Models: []string{"provider-model", "claude-sonnet-4-6"}}}})
+						h.Models(c)
+						var got struct {
+							Source        string                    `json:"source"`
+							Authoritative bool                      `json:"authoritative"`
+							Data          []gatewayModelItemForTest `json:"data"`
+						}
+						require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+						require.Equal(t, source, got.Source)
+						require.Equal(t, source, rec.Header().Get("X-Model-Catalog-Source"))
+						if source == "query_failed" {
+							require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+							require.False(t, got.Authoritative)
+							repo.err = nil
+							source = "authoritative_empty"
+							continue
+						}
+						require.Equal(t, http.StatusOK, rec.Code)
+						require.True(t, got.Authoritative)
+						require.NotNil(t, got.Data)
+						if source == "account_mapping" {
+							require.Equal(t, []string{"provider-model"}, modelIDsForTest(got.Data))
+						} else {
+							require.Empty(t, got.Data)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestGatewayModels_StaticCatalogIsNotAuthoritative(t *testing.T) {
+	for _, platform := range []string{service.PlatformAnthropic, service.PlatformGemini, service.PlatformOpenAI, service.PlatformAntigravity, service.PlatformGrok, service.PlatformComposite} {
+		t.Run(platform, func(t *testing.T) {
+			accountPlatform := platform
+			if platform == service.PlatformComposite {
+				accountPlatform = service.PlatformOpenAI
+			}
+			h := newGatewayModelsHandlerForTest(&gatewayModelsAccountRepoStub{byGroup: map[int64][]service.Account{1: {{ID: 1, Platform: accountPlatform}}}})
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+			c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{Group: &service.Group{ID: 1, Platform: platform}})
+			h.Models(c)
+			require.Equal(t, http.StatusOK, rec.Code)
+			var got struct {
+				Source        string                    `json:"source"`
+				Authoritative bool                      `json:"authoritative"`
+				Data          []gatewayModelItemForTest `json:"data"`
+			}
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+			require.Equal(t, "static_default", got.Source)
+			require.False(t, got.Authoritative)
+			want := defaultModelIDsForPlatform(accountPlatform)
+			account := service.Account{Platform: accountPlatform}
+			if mapping := account.GetModelMapping(); len(mapping) > 0 {
+				want = nil
+				for model := range mapping {
+					want = append(want, model)
+				}
+			}
+			require.ElementsMatch(t, want, modelIDsForTest(got.Data))
+		})
+	}
+}
+
+func TestGatewayModels_CompositeMixedCatalogIsNotAuthoritative(t *testing.T) {
+	h := newGatewayModelsHandlerForTest(&gatewayModelsAccountRepoStub{byGroup: map[int64][]service.Account{1: {
+		{ID: 1, Platform: service.PlatformOpenAI},
+		{ID: 2, Platform: service.PlatformZhipu, Credentials: map[string]any{"model_mapping": map[string]any{"glm-mapped": "glm-upstream"}}},
+	}}})
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{Group: &service.Group{ID: 1, Platform: service.PlatformComposite}})
+	h.Models(c)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got struct {
+		Source        string                    `json:"source"`
+		Authoritative bool                      `json:"authoritative"`
+		Data          []gatewayModelItemForTest `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Equal(t, "mixed", got.Source)
+	require.False(t, got.Authoritative)
+	require.Contains(t, modelIDsForTest(got.Data), "glm-mapped")
+	require.Contains(t, modelIDsForTest(got.Data), "gpt-5.5")
+	require.NotContains(t, modelIDsForTest(got.Data), "claude-sonnet-4-6")
+}
+
+func TestGatewayCodexModels_CompositeCNOnlyDoesNotInventDefaults(t *testing.T) {
+	h := newGatewayModelsHandlerForTest(&gatewayModelsAccountRepoStub{byGroup: map[int64][]service.Account{1: {{ID: 1, Platform: service.PlatformZhipu}}}})
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/models?client_version=0.147.0", nil)
+	c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{Group: &service.Group{ID: 1, Platform: service.PlatformComposite}})
+	h.CodexModels(c)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got codexModelsResponseForTest
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Empty(t, got.Models)
 }
