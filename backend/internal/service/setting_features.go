@@ -1260,3 +1260,10 @@ func mergePlatformQuotaDefaults(dst, src *DefaultPlatformQuotaSetting) {
 		dst.MonthlyLimitUSD = src.MonthlyLimitUSD
 	}
 }
+
+// IsAffiliateInvitationCodeEnabled allows reusable personal codes as registration credentials.
+// Missing settings fail closed; this does not override the registration master switch.
+func (s *SettingService) IsAffiliateInvitationCodeEnabled(ctx context.Context) bool {
+	value, err := s.settingRepo.GetValue(ctx, SettingKeyAffiliateInvitationCodeEnabled)
+	return err == nil && value == "true"
+}

@@ -157,6 +157,8 @@ export default {
         promoCode: '优惠码',
         promoCodeHint: '允许用户在注册时使用优惠码',
         invitationCode: '邀请码注册',
+        affiliateInvitationCode: '允许使用用户邀请返利码注册',
+        affiliateInvitationCodeHint: '启用邀请码注册后，允许现有用户的个人码重复邀请新成员，并自动记录邀请关系。注册总开关仍需开启；返利按邀请返利设置执行。',
         invitationCodeHint: '开启后，用户注册时需要填写有效的邀请码',
         passwordReset: '忘记密码',
         passwordResetHint: '允许用户通过邮箱重置密码',

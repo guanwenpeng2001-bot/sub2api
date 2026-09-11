@@ -186,3 +186,20 @@ func TestUpdateSettingsValidatesTencentCaptchaAppIDWhenEnabledFlagIsOmitted(t *t
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	require.Contains(t, rec.Body.String(), "positive integer")
 }
+
+func TestAffiliateInvitationSettingPersistsAndPreservesOmission(t *testing.T) {
+	h, repo := newStepUpSwitchTestHandler(t, map[string]string{})
+	for _, enabled := range []bool{true, false} {
+		rec := doUpdateSettings(t, h, map[string]any{"affiliate_invitation_code_enabled": enabled}, nil)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		expected := "false"
+		if enabled {
+			expected = "true"
+		}
+		require.Equal(t, expected, repo.values[service.SettingKeyAffiliateInvitationCodeEnabled])
+		require.Contains(t, rec.Body.String(), `"affiliate_invitation_code_enabled":`+expected)
+		rec = doUpdateSettings(t, h, map[string]any{"site_name": "Team"}, nil)
+		require.Equal(t, http.StatusOK, rec.Code)
+		require.Equal(t, expected, repo.values[service.SettingKeyAffiliateInvitationCodeEnabled])
+	}
+}

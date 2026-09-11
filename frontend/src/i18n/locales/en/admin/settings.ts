@@ -157,6 +157,8 @@ export default {
         promoCode: 'Promo Code',
         promoCodeHint: 'Allow users to use promo codes during registration',
         invitationCode: 'Invitation Code Registration',
+        affiliateInvitationCode: 'Allow personal affiliate codes for registration',
+        affiliateInvitationCodeHint: 'With invitation-only registration enabled, allow reusable personal codes and record the inviter automatically. Registration must remain enabled; rebates follow affiliate settings.',
         invitationCodeHint: 'When enabled, users must enter a valid invitation code to register',
         passwordReset: 'Password Reset',
         passwordResetHint: 'Allow users to reset their password via email',

@@ -59,26 +59,8 @@ func (s *AuthService) SendPendingOAuthVerifyCode(ctx context.Context, email stri
 }
 
 func (s *AuthService) validateOAuthRegistrationInvitation(ctx context.Context, invitationCode string) (*RedeemCode, error) {
-	if s == nil || s.settingService == nil || !s.settingService.IsInvitationCodeEnabled(ctx) {
-		return nil, nil
-	}
-	if s.redeemRepo == nil && s.oauthEmailFlowClient(ctx) == nil {
-		return nil, ErrServiceUnavailable
-	}
-
-	invitationCode = strings.TrimSpace(invitationCode)
-	if invitationCode == "" {
-		return nil, ErrInvitationCodeRequired
-	}
-
-	redeemCode, err := s.loadOAuthRegistrationInvitation(ctx, invitationCode)
-	if err != nil {
-		return nil, ErrInvitationCodeInvalid
-	}
-	if redeemCode.Type != RedeemTypeInvitation || !redeemCode.CanUse() {
-		return nil, ErrInvitationCodeInvalid
-	}
-	return redeemCode, nil
+	redeem, _, err := s.resolveRegistrationInvitation(ctx, invitationCode)
+	return redeem, err
 }
 
 // VerifyOAuthEmailCode verifies the locally entered email verification code for
@@ -283,7 +265,7 @@ func (s *AuthService) FinalizeOAuthEmailAccount(
 	}
 
 	signupSource = normalizeOAuthSignupSource(signupSource)
-	invitationRedeemCode, err := s.validateOAuthRegistrationInvitation(ctx, invitationCode)
+	invitationRedeemCode, inviterID, err := s.resolveRegistrationInvitation(ctx, invitationCode)
 	if err != nil {
 		return err
 	}
@@ -291,6 +273,13 @@ func (s *AuthService) FinalizeOAuthEmailAccount(
 		if err := s.useOAuthRegistrationInvitation(ctx, invitationRedeemCode.ID, user.ID); err != nil {
 			return ErrInvitationCodeInvalid
 		}
+	}
+
+	if err := s.bindRegistrationInviter(ctx, user.ID, inviterID); err != nil {
+		return err
+	}
+	if inviterID != 0 {
+		affiliateCode = ""
 	}
 
 	s.updateOAuthSignupSource(ctx, user.ID, signupSource)

@@ -554,6 +554,16 @@ func (h *AuthHandler) ValidateInvitationCode(c *gin.Context) {
 		return
 	}
 
+	// Use the same resolver as registration when personal codes are enabled.
+	if h.settingSvc.IsAffiliateInvitationCodeEnabled(c.Request.Context()) {
+		err := h.authService.ValidateRegistrationInvitation(c.Request.Context(), req.Code)
+		result := ValidateInvitationCodeResponse{Valid: err == nil}
+		if err != nil {
+			result.ErrorCode = "INVITATION_CODE_INVALID"
+		}
+		response.Success(c, result)
+		return
+	}
 	// 验证邀请码
 	redeemCode, err := h.redeemService.GetByCode(c.Request.Context(), req.Code)
 	if err != nil {

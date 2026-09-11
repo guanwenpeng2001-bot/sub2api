@@ -1708,6 +1708,13 @@
                 </div>
                 <Toggle v-model="form.invitation_code_enabled" />
               </div>
+              <div class="flex items-center justify-between gap-4">
+                <div>
+                  <h3 class="text-sm font-medium text-gray-900 dark:text-white">{{ t('admin.settings.registration.affiliateInvitationCode') }}</h3>
+                  <p class="mt-1 text-sm text-gray-500">{{ t('admin.settings.registration.affiliateInvitationCodeHint') }}</p>
+                </div>
+                <Toggle v-model="form.affiliate_invitation_code_enabled" data-testid="affiliate-invitation-toggle" />
+              </div>
               <!-- Password Reset - Only show when email verification is enabled -->
               <div
                 v-if="form.email_verify_enabled"
@@ -9687,6 +9694,7 @@ const form = reactive<SettingsForm>({
   registration_email_domain_quota_enabled: false,
   promo_code_enabled: true,
   invitation_code_enabled: false,
+  affiliate_invitation_code_enabled: false,
   password_reset_enabled: false,
   totp_enabled: false,
   totp_encryption_key_configured: false,
@@ -11325,6 +11333,7 @@ async function saveSettings() {
         form.registration_email_domain_quota_enabled,
       promo_code_enabled: form.promo_code_enabled,
       invitation_code_enabled: form.invitation_code_enabled,
+      affiliate_invitation_code_enabled: form.affiliate_invitation_code_enabled,
       password_reset_enabled: form.password_reset_enabled,
       totp_enabled: form.totp_enabled,
       passkey_enabled: form.passkey_enabled,

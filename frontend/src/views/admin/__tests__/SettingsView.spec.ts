@@ -376,6 +376,7 @@ const baseSettingsResponse = {
   registration_email_suffix_whitelist: [],
   promo_code_enabled: true,
   invitation_code_enabled: false,
+  affiliate_invitation_code_enabled: false,
   password_reset_enabled: false,
   totp_enabled: false,
   totp_encryption_key_configured: false,
@@ -1089,6 +1090,26 @@ describe("admin SettingsView payment visible method controls", () => {
     expect(payload).not.toHaveProperty("payment_visible_method_wxpay_source");
     expect(payload).not.toHaveProperty("payment_visible_method_alipay_enabled");
     expect(payload).not.toHaveProperty("payment_visible_method_wxpay_enabled");
+  });
+
+  it("loads and saves the personal invitation registration switch independently", async () => {
+    getSettings.mockResolvedValueOnce({
+      ...baseSettingsResponse,
+      invitation_code_enabled: true,
+      affiliate_invitation_code_enabled: true,
+    });
+    const wrapper = mountView();
+    await flushPromises();
+    await openSecurityTab(wrapper);
+    const toggle = wrapper.get('[data-testid="affiliate-invitation-toggle"]');
+    expect((toggle.element as HTMLInputElement).checked).toBe(true);
+    await toggle.setValue(false);
+    await wrapper.find("form").trigger("submit.prevent");
+    await flushPromises();
+    expect(updateSettings).toHaveBeenCalledWith(expect.objectContaining({
+      invitation_code_enabled: true,
+      affiliate_invitation_code_enabled: false,
+    }));
   });
 
   it("submits the admin recharge affiliate rebate setting", async () => {
